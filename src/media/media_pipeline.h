@@ -1,0 +1,117 @@
+// Media pipeline: VI -> VPSS -> {VENC -> RTSP, IVS -> motion rectangles}
+//
+// Bound with RK_MPI_SYS_Bind, so pixels move between hardware blocks without
+// ever entering this process's address space. The CPU only handles encoded
+// bitstream (a few hundred KB/s) and motion rectangles (bytes).
+//
+// This is why the whole video chain lives in a single process. Bound channel
+// handles are owned by the calling process, so splitting VENC and IVS into
+// separate processes would force pixels back through shared memory. On a single
+// core there is nothing to gain by splitting: processes time-slice either way,
+// and the split would only add copies and context switches.
+
+#ifndef BABY_MONITOR_MEDIA_MEDIA_PIPELINE_H
+#define BABY_MONITOR_MEDIA_MEDIA_PIPELINE_H
+
+#include <cstdint>
+#include <string>
+
+#include "base/rk_platform.h"
+#include "base/shared_records.h"
+
+namespace baby_monitor {
+
+struct MediaPipelineConfig {
+    uint32_t sensor_width = 1920;
+    uint32_t sensor_height = 1080;
+
+    // Encoder resolution. VPSS scales into this, so it may differ from sensor.
+    uint32_t stream_width = 1920;
+    uint32_t stream_height = 1080;
+
+    // Motion detection runs on a downscaled channel: IVS cost scales with area
+    // and rectangle coordinates are trivially rescaled afterwards.
+    uint32_t detect_width = 640;
+    uint32_t detect_height = 360;
+
+    uint32_t bitrate_kbps = 2048;
+    bool use_h265 = false;
+    int rtsp_port = 554;
+    std::string rtsp_path = "/live/0";
+
+    // IVS motion sensitivity, 1 = low, 2 = medium, 3 = high.
+    uint32_t motion_sensitivity = 2;
+
+    // Motion is reported when the moving area exceeds this fraction of the
+    // frame, expressed in per-mille to avoid floating point in the hot path.
+    uint32_t motion_area_threshold_permille = 20;
+};
+
+class MediaPipeline {
+public:
+    MediaPipeline(const MediaPipelineConfig& config, EventChannel* event_channel,
+                  HealthChannel* health_channel);
+    ~MediaPipeline();
+
+    MediaPipeline(const MediaPipeline&) = delete;
+    MediaPipeline& operator=(const MediaPipeline&) = delete;
+
+    bool Initialise();
+
+    // Runs until the process receives SIGTERM/SIGINT. Returns a process exit
+    // status.
+    int Run();
+
+private:
+    bool InitialiseVideoInput();
+    bool InitialiseScaler();
+    bool InitialiseEncoder();
+    bool InitialiseMotionDetector();
+    bool InitialiseRtspServer();
+    bool BindPipeline();
+
+    void TeardownBindings();
+    void TeardownModules();
+
+    // Moves one encoded frame from VENC to the RTSP session. Returns false only
+    // on an error worth logging; an empty queue is a normal outcome.
+    bool ForwardEncodedFrame();
+
+    // Drains IVS results and republishes a verdict to shared memory.
+    void PublishMotionResults();
+
+    void PublishHeartbeat();
+
+    MediaPipelineConfig config_;
+    EventChannel* event_channel_;
+    HealthChannel* health_channel_;
+
+    // Fixed channel assignments. VPSS channel 0 feeds the encoder at stream
+    // resolution; channel 1 feeds IVS at detection resolution.
+    static constexpr int kViDevice = 0;
+    static constexpr int kViPipe = 0;
+    static constexpr int kViChannel = 0;
+    static constexpr int kVpssGroup = 0;
+    static constexpr int kVpssEncodeChannel = 0;
+    static constexpr int kVpssDetectChannel = 1;
+    static constexpr int kVencChannel = 0;
+    static constexpr int kIvsChannel = 0;
+
+    bool video_input_ready_ = false;
+    bool scaler_ready_ = false;
+    bool encoder_ready_ = false;
+    bool motion_detector_ready_ = false;
+    bool bound_vi_to_vpss_ = false;
+    bool bound_vpss_to_venc_ = false;
+    bool bound_vpss_to_ivs_ = false;
+
+    rtsp_demo_handle rtsp_server_ = nullptr;
+    rtsp_session_handle rtsp_session_ = nullptr;
+
+    uint64_t published_motion_sequence_ = 0;
+    uint64_t heartbeat_counter_ = 0;
+};
+
+}  // namespace baby_monitor
+
+#endif  // BABY_MONITOR_MEDIA_MEDIA_PIPELINE_H

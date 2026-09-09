@@ -1,0 +1,21 @@
+# Build artifacts
+build/
+bin/
+*.o
+*.a
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*~
+
+# Shared memory files (runtime)
+/dev/shm/baby_monitor_*
+
+# Core dumps
+core
+core.*
+
+# Logs
+*.log
