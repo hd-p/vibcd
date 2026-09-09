@@ -37,6 +37,10 @@ bool ChildProcess::Start() {
         return true;
     }
 
+    // Read before the fork, so the child can detect a parent that died inside
+    // the fork/prctl window below.
+    const pid_t supervisor_pid = getpid();
+
     pid_t forked = fork();
     if (forked < 0) {
         RK_LOGE("fork() for %s failed: %d", name_.c_str(), errno);
@@ -48,10 +52,35 @@ bool ChildProcess::Start() {
         // operator tells these processes apart at a glance.
         prctl(PR_SET_NAME, name_.c_str());
 
-        // The parent's SIGCHLD disposition and any blocked signals are
+        // Die with the supervisor. Without this, a supervisor that goes down
+        // abnormally - SIGKILL, a crash, a debugger killing it, or a hardware
+        // watchdog reset - leaves its workers running as orphans that still hold
+        // the RTSP port, the camera and the audio capture device. The next launch
+        // then fails to initialise all three, and it looks like broken hardware
+        // rather than a leftover process.
+        if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0) {
+            RK_LOGW("PR_SET_PDEATHSIG for %s failed: %d", name_.c_str(), errno);
+        }
+
+        // The parent can exit between the fork and the prctl above. PDEATHSIG
+        // only fires for a death that happens after it is armed, so without this
+        // re-check that window produces exactly the orphan it was meant to
+        // prevent.
+        if (getppid() != supervisor_pid) {
+            _exit(0);
+        }
+
+        // The parent's signal dispositions and any blocked signals are
         // inherited; reset to defaults so the child's own handlers behave
-        // predictably.
+        // predictably. SIGTERM and SIGINT matter as much as SIGCHLD: each
+        // pipeline installs its handler at the top of Run(), so until then the
+        // child still runs the supervisor's handler, which sets a flag only the
+        // supervisor reads. That would swallow every SIGTERM arriving during
+        // Initialise() - including the PDEATHSIG one armed above, and the one
+        // Stop() sends, leaving SIGKILL as the only thing that works.
         signal(SIGCHLD, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGINT, SIG_DFL);
 
         int status = entry_point_ ? entry_point_() : 0;
 

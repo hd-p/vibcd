@@ -18,6 +18,7 @@
 
 #include "base/rk_platform.h"
 #include "base/shared_records.h"
+#include "media/isp_controller.h"
 
 namespace baby_monitor {
 
@@ -39,12 +40,24 @@ struct MediaPipelineConfig {
     int rtsp_port = 554;
     std::string rtsp_path = "/live/0";
 
+    // Motion detection can be switched off entirely, which drops the second
+    // VPSS channel and the IVS binding with it. Useful for isolating the video
+    // path: if the encoder only produces frames with this disabled, the fault
+    // is in the fan-out rather than in VI or VENC.
+    bool enable_motion_detection = true;
+
     // IVS motion sensitivity, 1 = low, 2 = medium, 3 = high.
     uint32_t motion_sensitivity = 2;
 
     // Motion is reported when the moving area exceeds this fraction of the
     // frame, expressed in per-mille to avoid floating point in the hot path.
     uint32_t motion_area_threshold_permille = 20;
+
+    // Sensor tuning files for the ISP 3A loop. Without a running 3A loop the
+    // ISP delivers only as many frames as the VI buffer count and then stops,
+    // so this is required rather than optional. /etc/iqfiles is a symlink to
+    // /oem/usr/share/iqfiles on this board.
+    std::string iq_file_dir = "/etc/iqfiles";
 };
 
 class MediaPipeline {
@@ -105,11 +118,22 @@ private:
     bool bound_vpss_to_venc_ = false;
     bool bound_vpss_to_ivs_ = false;
 
+    // Declared before the MPI state so it is destroyed last: the 3A loop must
+    // outlive the VI channel it feeds.
+    IspController isp_;
+
     rtsp_demo_handle rtsp_server_ = nullptr;
     rtsp_session_handle rtsp_session_ = nullptr;
 
     uint64_t published_motion_sequence_ = 0;
     uint64_t heartbeat_counter_ = 0;
+
+    // Frames handed to the RTSP session since start, and the last non-empty
+    // GetStream error. Both exist so Run() can report throughput periodically
+    // instead of logging per frame: "no video" and "video but no client" look
+    // identical from outside otherwise.
+    uint64_t frames_forwarded_ = 0;
+    int32_t last_getstream_error_ = 0;
 };
 
 }  // namespace baby_monitor

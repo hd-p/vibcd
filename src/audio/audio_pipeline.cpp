@@ -1,6 +1,7 @@
 #include "audio/audio_pipeline.h"
 
 #include <csignal>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 
@@ -50,9 +51,18 @@ bool AudioPipeline::Initialise() {
 
     // Cry detection is a feature, not a prerequisite. A missing model file must
     // not take audio capture down with it, so this failure is tolerated.
+    //
+    // This has to run *before* EnableAudioInputChannel: RK_MPI_AI_EnableChn is
+    // what builds the AI task graph, and it only wires in a BCD node if the
+    // detector was registered first. Enabling BCD after the graph exists leaves
+    // RK_MPI_AI_EnableBcd operating on a node that was never created, and
+    // librockit dereferences null inside it. The giveaway in the rockit log is
+    // "check enabled - ... bcd:0" appearing despite BCD being requested.
     if (!InitialiseCryDetector()) {
         RK_LOGW("Cry detection is unavailable; audio capture continues without it");
     }
+
+    if (!EnableAudioInputChannel()) return false;
 
     if (!BindPipeline()) return false;
 
@@ -66,7 +76,7 @@ bool AudioPipeline::InitialiseAudioInput() {
     AIO_ATTR_S audio_attributes;
     memset(&audio_attributes, 0, sizeof(audio_attributes));
 
-    audio_attributes.soundCard.channels = config_.channel_count;
+    audio_attributes.soundCard.channels = config_.card_channel_count;
     audio_attributes.soundCard.sampleRate = config_.sample_rate;
     audio_attributes.soundCard.bitWidth = AUDIO_BIT_WIDTH_16;
 
@@ -77,7 +87,18 @@ bool AudioPipeline::InitialiseAudioInput() {
                                                              : AUDIO_SOUND_MODE_STEREO;
     audio_attributes.u32FrmNum = kCaptureFrameCount;
     audio_attributes.u32PtNumPerFrm = config_.samples_per_frame;
-    audio_attributes.u32ChnCnt = config_.channel_count;
+
+    // The card's channel count again, not the stream's. rk_mpi_ai_test hardcodes
+    // this to 2 on this SoC for the same reason.
+    audio_attributes.u32ChnCnt = config_.card_channel_count;
+
+    // Named rather than indexed on purpose; see capture_card_name in the header
+    // for what rockit does with an empty name.
+    if (!config_.capture_card_name.empty()) {
+        snprintf(reinterpret_cast<char*>(audio_attributes.u8CardName),
+                 sizeof(audio_attributes.u8CardName), "%s",
+                 config_.capture_card_name.c_str());
+    }
 
     RK_S32 result = RK_MPI_AI_SetPubAttr(kAiDevice, &audio_attributes);
     if (result != RK_SUCCESS) {
@@ -92,11 +113,19 @@ bool AudioPipeline::InitialiseAudioInput() {
     }
     audio_input_ready_ = true;
 
-    result = RK_MPI_AI_EnableChn(kAiDevice, kAiChannel);
+    return true;
+}
+
+// Split out from InitialiseAudioInput so every detector that contributes a node
+// to the AI task graph can be registered before the graph is built. See the
+// ordering note in Initialise().
+bool AudioPipeline::EnableAudioInputChannel() {
+    RK_S32 result = RK_MPI_AI_EnableChn(kAiDevice, kAiChannel);
     if (result != RK_SUCCESS) {
         RK_LOGE("RK_MPI_AI_EnableChn failed: %#x", result);
         return false;
     }
+    audio_channel_ready_ = true;
 
     RK_MPI_AI_SetVolume(kAiDevice, config_.capture_volume);
     RK_MPI_AI_SetTrackMode(kAiDevice, AUDIO_TRACK_NORMAL);
@@ -295,8 +324,15 @@ void AudioPipeline::TeardownModules() {
         encoder_ready_ = false;
     }
 
-    if (audio_input_ready_) {
+    // Two flags, not one: the channel can fail to enable after the device came
+    // up, and calling DisableChn on a channel that was never enabled is its own
+    // way to crash inside librockit.
+    if (audio_channel_ready_) {
         RK_MPI_AI_DisableChn(kAiDevice, kAiChannel);
+        audio_channel_ready_ = false;
+    }
+
+    if (audio_input_ready_) {
         RK_MPI_AI_Disable(kAiDevice);
         audio_input_ready_ = false;
     }

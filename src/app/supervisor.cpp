@@ -71,7 +71,64 @@ void ResetHeartbeat(HealthChannel* channel, MonitoredProcess slot) {
     beat.updated_at_us = 0;
 }
 
+// Creates both shared channels and initialises their mutexes. Shared by the
+// supervisor and the single-service debug path, which must produce identical
+// channels: a worker only ever attaches, never creates.
+bool CreateChannels(SharedMemory<EventChannel>* event_channel,
+                    SharedMemory<HealthChannel>* health_channel) {
+    // Clear debris from an unclean shutdown before creating fresh segments. A
+    // leftover segment can be the wrong size for the current build, or hold a
+    // mutex locked by a process that no longer exists.
+    SharedMemory<EventChannel>::Unlink(kEventChannelName);
+    SharedMemory<HealthChannel>::Unlink(kHealthChannelName);
+
+    if (!event_channel->Create(kEventChannelName)) {
+        RK_LOGE("Could not create %s", kEventChannelName);
+        return false;
+    }
+    if (!InitialiseSharedMutex(&(*event_channel)->lock)) {
+        RK_LOGE("Could not initialise the event channel mutex");
+        return false;
+    }
+
+    if (!health_channel->Create(kHealthChannelName)) {
+        RK_LOGE("Could not create %s", kHealthChannelName);
+        return false;
+    }
+    if (!InitialiseSharedMutex(&(*health_channel)->lock)) {
+        RK_LOGE("Could not initialise the health channel mutex");
+        return false;
+    }
+
+    RK_LOGI("Shared channels ready: events %zu bytes, health %zu bytes",
+            sizeof(EventChannel), sizeof(HealthChannel));
+    return true;
+}
+
 }  // namespace
+
+int RunSingleService(const SupervisorConfig& config, MonitoredProcess service) {
+    // No fork, no restarts, and deliberately no hardware watchdog: this path
+    // exists to be stepped through in a debugger, and a breakpoint held longer
+    // than the watchdog timeout would reset the board.
+    SharedMemory<EventChannel> event_channel;
+    SharedMemory<HealthChannel> health_channel;
+    if (!CreateChannels(&event_channel, &health_channel)) {
+        return 1;
+    }
+
+    switch (service) {
+        case MonitoredProcess::MEDIA:
+            RK_LOGI("Running baby_media in this process (no fork, no watchdog)");
+            return RunMediaService(config.media);
+        case MonitoredProcess::AUDIO:
+            RK_LOGI("Running baby_audio in this process (no fork, no watchdog)");
+            return RunAudioService(config.audio);
+        default:
+            RK_LOGE("Not a runnable service");
+            return 1;
+    }
+}
 
 int RunSupervisor(const SupervisorConfig& config) {
     signal(SIGTERM, HandleStopSignal);
@@ -82,34 +139,11 @@ int RunSupervisor(const SupervisorConfig& config) {
     // auto-reap, and waitpid would then never report an exit status.
     signal(SIGCHLD, SIG_DFL);
 
-    // Clear debris from an unclean shutdown before creating fresh segments. A
-    // leftover segment can be the wrong size for the current build, or hold a
-    // mutex locked by a process that no longer exists.
-    SharedMemory<EventChannel>::Unlink(kEventChannelName);
-    SharedMemory<HealthChannel>::Unlink(kHealthChannelName);
-
     SharedMemory<EventChannel> event_channel;
-    if (!event_channel.Create(kEventChannelName)) {
-        RK_LOGE("Could not create %s", kEventChannelName);
-        return 1;
-    }
-    if (!InitialiseSharedMutex(&event_channel->lock)) {
-        RK_LOGE("Could not initialise the event channel mutex");
-        return 1;
-    }
-
     SharedMemory<HealthChannel> health_channel;
-    if (!health_channel.Create(kHealthChannelName)) {
-        RK_LOGE("Could not create %s", kHealthChannelName);
+    if (!CreateChannels(&event_channel, &health_channel)) {
         return 1;
     }
-    if (!InitialiseSharedMutex(&health_channel->lock)) {
-        RK_LOGE("Could not initialise the health channel mutex");
-        return 1;
-    }
-
-    RK_LOGI("Shared channels ready: events %zu bytes, health %zu bytes",
-            sizeof(EventChannel), sizeof(HealthChannel));
 
     // Copied into the lambdas so each child runs from its own snapshot and does
     // not depend on the parent's frame still being alive.

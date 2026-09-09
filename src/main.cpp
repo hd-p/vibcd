@@ -9,6 +9,10 @@
 //
 // Only the supervisor forks, so only the supervisor can reap. That is what makes
 // its liveness information trustworthy.
+//
+// --no-fork collapses this to a single process running one pipeline, for use
+// under a debugger: gdb detaches from forked children by default, so in the
+// normal tree the code that fails is the code gdb cannot see.
 
 #include <getopt.h>
 
@@ -18,6 +22,7 @@
 
 #include "app/supervisor.h"
 #include "base/rk_platform.h"
+#include "base/shared_records.h"
 
 namespace {
 
@@ -35,8 +40,12 @@ void PrintUsage(const char* program_name) {
     printf("  -s, --sensitivity <n>  1 low, 2 medium, 3 high (default 2)\n");
     printf("      --detect <WxH>     IVS analysis resolution (default 640x360)\n");
     printf("      --motion-area <n>  moving area threshold in per-mille (default 20)\n");
+    printf("      --no-motion        drop the IVS branch entirely, leaving\n");
+    printf("                         VI -> VPSS -> VENC only\n");
     printf("\nAudio:\n");
     printf("  -r, --rate <hz>        sample rate (default 16000)\n");
+    printf("      --audio-card <hw>  capture card as hw:<card>,<device>\n");
+    printf("                         (default hw:0,0; check arecord -l)\n");
     printf("      --cry-model <path> BCD model, empty to use built-in heuristics\n");
     printf("                         (default /oem/usr/share/vqefiles/"
            "rkaudio_model_sed_bcd.rknn)\n");
@@ -44,11 +53,18 @@ void PrintUsage(const char* program_name) {
     printf("      --watchdog <path>  watchdog device, empty string to disable\n");
     printf("                         (default /dev/watchdog)\n");
     printf("      --max-restarts <n> restart attempts per worker (default 5)\n");
+    printf("\nDebugging:\n");
+    printf("      --no-fork <svc>    run one service (media or audio) in this\n");
+    printf("                         process instead of forking workers: no\n");
+    printf("                         restarts and no watchdog, so a breakpoint\n");
+    printf("                         cannot reset the board\n");
     printf("\n  -?, --help             this message\n\n");
     printf("Examples:\n");
     printf("  %s\n", program_name);
     printf("  %s -w 1920 -h 1080 -b 2048 -e h265\n", program_name);
-    printf("  %s --watchdog '' --max-restarts 0     # debugging\n\n", program_name);
+    printf("  %s --watchdog '' --max-restarts 0     # debugging\n", program_name);
+    printf("  %s --no-fork media                    # debugging one pipeline\n\n",
+           program_name);
 }
 
 // Long-only options take values outside the ASCII range so they cannot collide
@@ -57,9 +73,12 @@ enum LongOnlyOption {
     kOptionStreamResolution = 0x100,
     kOptionDetectResolution,
     kOptionMotionArea,
+    kOptionNoMotion,
     kOptionCryModelPath,
+    kOptionAudioCard,
     kOptionWatchdogDevice,
     kOptionMaxRestarts,
+    kOptionNoFork,
 };
 
 const struct option kLongOptions[] = {
@@ -73,9 +92,12 @@ const struct option kLongOptions[] = {
     {"stream", required_argument, nullptr, kOptionStreamResolution},
     {"detect", required_argument, nullptr, kOptionDetectResolution},
     {"motion-area", required_argument, nullptr, kOptionMotionArea},
+    {"no-motion", no_argument, nullptr, kOptionNoMotion},
     {"cry-model", required_argument, nullptr, kOptionCryModelPath},
+    {"audio-card", required_argument, nullptr, kOptionAudioCard},
     {"watchdog", required_argument, nullptr, kOptionWatchdogDevice},
     {"max-restarts", required_argument, nullptr, kOptionMaxRestarts},
+    {"no-fork", required_argument, nullptr, kOptionNoFork},
     {"help", no_argument, nullptr, '?'},
     {nullptr, 0, nullptr, 0},
 };
@@ -97,12 +119,26 @@ bool ParseResolution(const char* text, uint32_t* width, uint32_t* height) {
 }  // namespace
 
 int main(int argc, char* argv[]) {
+    // Line buffering, not the default block buffering. When stdout is a file or
+    // a pipe rather than a terminal, libc buffers 4 KB before flushing, so our
+    // own log lines sit in that buffer while librockit's (which writes through)
+    // appear immediately. Diagnosing this pipeline from a redirected log is
+    // impossible when half the story is stuck in userspace, and a crash loses
+    // the buffer entirely. The SDK's own samples call setlinebuf for this.
+    setlinebuf(stdout);
+    setlinebuf(stderr);
+
     baby_monitor::SupervisorConfig config;
     config.audio.cry_model_path = "/oem/usr/share/vqefiles/rkaudio_model_sed_bcd.rknn";
 
     // Tracks whether --stream was given, so the encoder resolution can default
     // to the sensor resolution even when -w/-h change it.
     bool stream_resolution_specified = false;
+
+    // Set by --no-fork: run this one service in-process rather than supervising.
+    bool single_service_requested = false;
+    baby_monitor::MonitoredProcess single_service =
+        baby_monitor::MonitoredProcess::MEDIA;
 
     int option = 0;
     while ((option = getopt_long(argc, argv, "w:h:b:e:p:s:r:?", kLongOptions,
@@ -175,14 +211,32 @@ int main(int argc, char* argv[]) {
                 config.media.motion_area_threshold_permille =
                     static_cast<uint32_t>(atoi(optarg));
                 break;
+            case kOptionNoMotion:
+                config.media.enable_motion_detection = false;
+                break;
             case kOptionCryModelPath:
                 config.audio.cry_model_path = optarg;
+                break;
+            case kOptionAudioCard:
+                config.audio.capture_card_name = optarg;
                 break;
             case kOptionWatchdogDevice:
                 config.watchdog_device = optarg;
                 break;
             case kOptionMaxRestarts:
                 config.max_restarts = atoi(optarg);
+                break;
+            case kOptionNoFork:
+                if (strcmp(optarg, "media") == 0) {
+                    single_service = baby_monitor::MonitoredProcess::MEDIA;
+                } else if (strcmp(optarg, "audio") == 0) {
+                    single_service = baby_monitor::MonitoredProcess::AUDIO;
+                } else {
+                    fprintf(stderr, "Unknown service '%s'; expected media or audio\n",
+                            optarg);
+                    return 1;
+                }
+                single_service_requested = true;
                 break;
             case '?':
                 PrintUsage(argv[0]);
@@ -223,8 +277,15 @@ int main(int argc, char* argv[]) {
             config.media.detect_width, config.media.detect_height,
             config.media.motion_sensitivity,
             config.media.motion_area_threshold_permille);
-    RK_LOGI("Audio %u Hz x%u, %u samples per frame", config.audio.sample_rate,
-            config.audio.channel_count, config.audio.samples_per_frame);
+    RK_LOGI("Audio %u Hz x%u, %u samples per frame, card %s", config.audio.sample_rate,
+            config.audio.channel_count, config.audio.samples_per_frame,
+            config.audio.capture_card_name.empty()
+                ? "(by index)"
+                : config.audio.capture_card_name.c_str());
+
+    if (single_service_requested) {
+        return baby_monitor::RunSingleService(config, single_service);
+    }
 
     return baby_monitor::RunSupervisor(config);
 }

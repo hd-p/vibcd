@@ -20,6 +20,7 @@
 #include <string>
 
 #include "audio/audio_pipeline.h"
+#include "base/shared_records.h"
 #include "media/media_pipeline.h"
 
 namespace baby_monitor {
@@ -51,6 +52,12 @@ struct SupervisorConfig {
 };
 
 int RunSupervisor(const SupervisorConfig& config);
+
+// Runs one worker directly in the calling process: no fork, no restarts, and no
+// hardware watchdog. Both pipelines normally run in forked children, which a
+// debugger detaches from by default, so the code that actually fails is the code
+// gdb cannot see. This is the path to attach to instead.
+int RunSingleService(const SupervisorConfig& config, MonitoredProcess service);
 
 }  // namespace baby_monitor
 

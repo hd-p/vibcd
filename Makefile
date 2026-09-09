@@ -20,6 +20,14 @@ INCLUDES += -I$(RK_MEDIA_OUTPUT)/include
 INCLUDES += -I$(RK_MEDIA_OUTPUT)/include/rkaiq
 INCLUDES += -I$(RK_MEDIA_OUTPUT)/include/rkaiq/uAPI2
 INCLUDES += -I$(RK_MEDIA_OUTPUT)/include/rkaiq/common
+# The rkaiq headers include each other by bare filename, so every directory
+# holding a referenced header has to be on the search path. Reached in this
+# order from rk_aiq_user_api2_sysctl.h: xcore for "base/xcam_common.h", algos
+# for "adebayer/...", then iq_parser and iq_parser_v2 for "RkAiqCalibDbTypes.h".
+INCLUDES += -I$(RK_MEDIA_OUTPUT)/include/rkaiq/xcore
+INCLUDES += -I$(RK_MEDIA_OUTPUT)/include/rkaiq/algos
+INCLUDES += -I$(RK_MEDIA_OUTPUT)/include/rkaiq/iq_parser
+INCLUDES += -I$(RK_MEDIA_OUTPUT)/include/rkaiq/iq_parser_v2
 
 # c++17 is required, not a preference: std::atomic<>::is_always_lock_free and
 # inline static data members are both C++17, and the earlier -std=c++11 setting
@@ -32,12 +40,13 @@ LDFLAGS := -L$(RK_MEDIA_OUTPUT)/lib
 LDFLAGS += -Wl,-rpath-link,$(RK_MEDIA_OUTPUT)/lib
 
 # librtsp is a static archive, so it has to follow the objects that reference it.
-LDLIBS := -lrockit -lrockchip_mpp -lrtsp -lpthread -lrt -ldl
+LDLIBS := -lrockit -lrockchip_mpp -lrtsp -lrkaiq -lpthread -lrt -ldl
 
 SOURCES := \
 	$(SRC_DIR)/main.cpp \
 	$(SRC_DIR)/base/child_process.cpp \
 	$(SRC_DIR)/base/robust_mutex.cpp \
+	$(SRC_DIR)/media/isp_controller.cpp \
 	$(SRC_DIR)/media/media_pipeline.cpp \
 	$(SRC_DIR)/audio/audio_pipeline.cpp \
 	$(SRC_DIR)/app/media_service.cpp \
