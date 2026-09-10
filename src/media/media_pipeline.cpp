@@ -319,6 +319,32 @@ bool MediaPipeline::InitialiseEncoder() {
     }
     encoder_ready_ = true;
 
+    // Rate control parameters are mandatory even when using CBR; without them
+    // the hardware encoder never activates (hw_running stays 0). The SDK samples
+    // set QP ranges after CreateChn and before StartRecvFrame.
+    VENC_RC_PARAM_S rc_param;
+    memset(&rc_param, 0, sizeof(rc_param));
+    if (codec == RK_VIDEO_ID_AVC) {
+        rc_param.stParamH264.u32MinQp = 10;
+        rc_param.stParamH264.u32MaxQp = 51;
+        rc_param.stParamH264.u32MinIQp = 10;
+        rc_param.stParamH264.u32MaxIQp = 51;
+        rc_param.stParamH264.u32FrmMinQp = 28;
+        rc_param.stParamH264.u32FrmMinIQp = 28;
+    } else {
+        rc_param.stParamH265.u32MinQp = 10;
+        rc_param.stParamH265.u32MaxQp = 51;
+        rc_param.stParamH265.u32MinIQp = 10;
+        rc_param.stParamH265.u32MaxIQp = 51;
+        rc_param.stParamH265.u32FrmMinQp = 28;
+        rc_param.stParamH265.u32FrmMinIQp = 28;
+    }
+    result = RK_MPI_VENC_SetRcParam(kVencChannel, &rc_param);
+    if (result != RK_SUCCESS) {
+        RK_LOGE("RK_MPI_VENC_SetRcParam failed: %#x", result);
+        return false;
+    }
+
     VENC_RECV_PIC_PARAM_S receive_parameters;
     memset(&receive_parameters, 0, sizeof(receive_parameters));
     receive_parameters.s32RecvPicNum = -1;  // unbounded
