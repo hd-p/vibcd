@@ -1,4 +1,6 @@
-// Media pipeline: VI -> VPSS -> {VENC -> RTSP, IVS -> motion rectangles}
+// Media pipeline: VI ch0 -> VPSS -> VENC -> RTSP, and VI ch1 -> IVS -> motion
+// rectangles. The fan-out is at VI, not at VPSS: two ISP outputs on one device
+// cost no scaler time, so the detection path never competes with the encoder.
 //
 // Bound with RK_MPI_SYS_Bind, so pixels move between hardware blocks without
 // ever entering this process's address space. The CPU only handles encoded
@@ -41,7 +43,7 @@ struct MediaPipelineConfig {
     std::string rtsp_path = "/live/0";
 
     // Motion detection can be switched off entirely, which drops the second
-    // VPSS channel and the IVS binding with it. Useful for isolating the video
+    // VI channel and the IVS binding with it. Useful for isolating the video
     // path: if the encoder only produces frames with this disabled, the fault
     // is in the fan-out rather than in VI or VENC.
     bool enable_motion_detection = true;
@@ -77,6 +79,11 @@ public:
 
 private:
     bool InitialiseVideoInput();
+
+    // Second ISP output on the same VI device, scaled to detection resolution
+    // and bound straight to IVS. Only called when motion detection is enabled.
+    bool InitialiseDetectInput();
+
     bool InitialiseScaler();
     bool InitialiseEncoder();
     bool InitialiseMotionDetector();
@@ -99,24 +106,29 @@ private:
     EventChannel* event_channel_;
     HealthChannel* health_channel_;
 
-    // Fixed channel assignments. VPSS channel 0 feeds the encoder at stream
-    // resolution; channel 1 feeds IVS at detection resolution.
+    // Fixed channel assignments. VI channel 0 carries the full-resolution
+    // stream into VPSS and on to the encoder; VI channel 1 is a second ISP
+    // output, scaled down, that feeds IVS directly. The detection path used to
+    // hang off VPSS channel 1, but a two-channel VPSS group starved the encoder
+    // on this board, and rkipc fans out at VI rather than at VPSS for exactly
+    // this reason.
     static constexpr int kViDevice = 0;
     static constexpr int kViPipe = 0;
     static constexpr int kViChannel = 0;
+    static constexpr int kViDetectChannel = 1;
     static constexpr int kVpssGroup = 0;
     static constexpr int kVpssEncodeChannel = 0;
-    static constexpr int kVpssDetectChannel = 1;
     static constexpr int kVencChannel = 0;
     static constexpr int kIvsChannel = 0;
 
     bool video_input_ready_ = false;
+    bool detect_input_ready_ = false;
     bool scaler_ready_ = false;
     bool encoder_ready_ = false;
     bool motion_detector_ready_ = false;
     bool bound_vi_to_vpss_ = false;
     bool bound_vpss_to_venc_ = false;
-    bool bound_vpss_to_ivs_ = false;
+    bool bound_vi_to_ivs_ = false;
 
     // Declared before the MPI state so it is destroyed last: the 3A loop must
     // outlive the VI channel it feeds.

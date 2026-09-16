@@ -27,11 +27,6 @@ uint64_t MonotonicMicroseconds() {
 // IVS analyses on a macroblock grid, so its input dimensions round up to 16.
 uint32_t AlignUpTo16(uint32_t value) { return (value + 15) & ~15u; }
 
-// VENC's virtual (stride) dimensions only need even values. Rounding them to 16
-// instead makes the encoder disagree with VPSS about the frame geometry; see the
-// note in InitialiseEncoder.
-uint32_t AlignUpTo2(uint32_t value) { return (value + 1) & ~1u; }
-
 }  // namespace
 
 MediaPipeline::MediaPipeline(const MediaPipelineConfig& config,
@@ -53,14 +48,25 @@ bool MediaPipeline::Initialise() {
     // running. Without this, the sensor filled the VI buffers once (exactly
     // u32BufCount frames) and then stopped forever, which looked like a broken
     // encoder rather than a missing AE/AWB engine.
-    if (!isp_.Start(kViDevice, config_.iq_file_dir)) {
-        RK_LOGE("ISP/3A engine did not start; the sensor will not deliver frames");
-        return false;
+    //
+    // An empty iq_file_dir skips 3A entirely rather than failing. That is a
+    // diagnostic escape hatch: simple_vi_bind_vpss_bind_venc.c encodes happily
+    // on this board without ever starting 3A, so being able to run the same way
+    // isolates whether our 3A setup is what starves the encoder. Exposure will
+    // be whatever the sensor defaults to.
+    if (!config_.iq_file_dir.empty()) {
+        if (!isp_.Start(kViDevice, config_.iq_file_dir)) {
+            RK_LOGE("ISP/3A engine did not start; the sensor will not deliver frames");
+            return false;
+        }
+    } else {
+        RK_LOGW("ISP 3A disabled (empty iqfiles path); exposure is uncontrolled");
     }
 
     // Order matters: every module must exist before anything is bound, because
     // binding starts data flowing immediately.
     if (!InitialiseVideoInput()) return false;
+    if (config_.enable_motion_detection && !InitialiseDetectInput()) return false;
     if (!InitialiseScaler()) return false;
     if (!InitialiseEncoder()) return false;
     if (config_.enable_motion_detection && !InitialiseMotionDetector()) return false;
@@ -68,7 +74,8 @@ bool MediaPipeline::Initialise() {
     if (!BindPipeline()) return false;
 
     if (config_.enable_motion_detection) {
-        RK_LOGI("Media pipeline ready: VI %ux%u -> VPSS -> {VENC %ux%u, IVS %ux%u}",
+        RK_LOGI("Media pipeline ready: VI ch0 %ux%u -> VPSS -> VENC %ux%u, "
+                "VI ch1 %ux%u -> IVS",
                 config_.sensor_width, config_.sensor_height, config_.stream_width,
                 config_.stream_height, config_.detect_width, config_.detect_height);
     } else {
@@ -114,23 +121,21 @@ bool MediaPipeline::InitialiseVideoInput() {
     VI_CHN_ATTR_S channel_attributes;
     memset(&channel_attributes, 0, sizeof(channel_attributes));
 
-    // Three, not two. This is the number of buffers the ISP cycles through, so
-    // it bounds how far the capture side may run ahead of the consumer: with two,
-    // the ISP has to wait for VPSS to release one before it can fill the next,
-    // and the chain delivers a frame every few seconds instead of every 33ms.
-    // The SDK's VI -> VPSS -> VENC samples all use 3 for this reason.
-    channel_attributes.stIspOpt.u32BufCount = 3;
+    // 2, matching simple_vi_bind_vpss_bind_venc.c, which encodes fine on this
+    // board. Raising it to 3 was an attempt to give the ISP more headroom and it
+    // did not help.
+    channel_attributes.stIspOpt.u32BufCount = 2;
     channel_attributes.stIspOpt.enMemoryType = VI_V4L2_MEMORY_TYPE_DMABUF;
     channel_attributes.stSize.u32Width = config_.sensor_width;
     channel_attributes.stSize.u32Height = config_.sensor_height;
     channel_attributes.enPixelFormat = RK_FMT_YUV420SP;
     channel_attributes.enCompressMode = COMPRESS_MODE_NONE;
 
-    // -1 means "no rate limit, follow the sensor". Leaving these zeroed made the
-    // driver log "illegal param s32SrcFrameRate(0) s32DstFrameRate(0)" and then
-    // apply a rate of its own choosing rather than the sensor's 30fps.
-    channel_attributes.stFrameRate.s32SrcFrameRate = -1;
-    channel_attributes.stFrameRate.s32DstFrameRate = -1;
+    // stFrameRate is deliberately left zeroed. The driver logs "illegal param
+    // s32SrcFrameRate(0) s32DstFrameRate(0)" for this, and setting -1/-1 to
+    // silence that warning is what the working sample does NOT do - it leaves
+    // the field at zero and encodes at the sensor rate regardless. The warning
+    // is cosmetic; matching the sample matters more.
 
     // Depth 0 means frames go only to the bound consumer and are never queued
     // for userspace retrieval. That is exactly what we want: nothing in this
@@ -154,11 +159,59 @@ bool MediaPipeline::InitialiseVideoInput() {
     return true;
 }
 
+bool MediaPipeline::InitialiseDetectInput() {
+    // A second channel on the same VI device and pipe. The ISP scales this one
+    // down on its own, so the detection path costs no RGA time at all - that is
+    // the whole point of fanning out here rather than at VPSS. rkipc runs three
+    // such channels (2560x1440, 704x576, 960x540) off one pipe, which is what
+    // establishes that per-channel sizes are independent.
+    VI_CHN_ATTR_S channel_attributes;
+    memset(&channel_attributes, 0, sizeof(channel_attributes));
+
+    channel_attributes.stIspOpt.u32BufCount = 2;
+    channel_attributes.stIspOpt.enMemoryType = VI_V4L2_MEMORY_TYPE_DMABUF;
+
+    // stMaxSize bounds the buffers the ISP allocates for this channel; stSize is
+    // what it actually delivers. Both are the detection resolution here, so the
+    // channel costs about 345 KB per buffer instead of a 1080p frame's 3 MB.
+    channel_attributes.stIspOpt.stMaxSize.u32Width = AlignUpTo16(config_.detect_width);
+    channel_attributes.stIspOpt.stMaxSize.u32Height = AlignUpTo16(config_.detect_height);
+    channel_attributes.stSize.u32Width = AlignUpTo16(config_.detect_width);
+    channel_attributes.stSize.u32Height = AlignUpTo16(config_.detect_height);
+    channel_attributes.enPixelFormat = RK_FMT_YUV420SP;
+    channel_attributes.enCompressMode = COMPRESS_MODE_NONE;
+
+    // Depth 0 for the same reason as channel 0: IVS is a bound consumer, so no
+    // userspace queue should accumulate.
+    channel_attributes.u32Depth = 0;
+
+    RK_S32 result =
+        RK_MPI_VI_SetChnAttr(kViDevice, kViDetectChannel, &channel_attributes);
+    if (result != RK_SUCCESS) {
+        RK_LOGE("RK_MPI_VI_SetChnAttr(detect) failed: %#x", result);
+        return false;
+    }
+
+    result = RK_MPI_VI_EnableChn(kViDevice, kViDetectChannel);
+    if (result != RK_SUCCESS) {
+        RK_LOGE("RK_MPI_VI_EnableChn(detect) failed: %#x", result);
+        return false;
+    }
+
+    detect_input_ready_ = true;
+    return true;
+}
+
 bool MediaPipeline::InitialiseScaler() {
     VPSS_GRP_ATTR_S group_attributes;
     memset(&group_attributes, 0, sizeof(group_attributes));
-    group_attributes.u32MaxW = config_.sensor_width;
-    group_attributes.u32MaxH = config_.sensor_height;
+
+    // 4096x4096, not the sensor size. This is the group's upper bound, not its
+    // working resolution, and every SDK sample hardcodes the maximum here. A
+    // group sized exactly to the sensor left no headroom for the channel
+    // scaler's internal alignment.
+    group_attributes.u32MaxW = 4096;
+    group_attributes.u32MaxH = 4096;
     group_attributes.enPixelFormat = RK_FMT_YUV420SP;
     group_attributes.enCompressMode = COMPRESS_MODE_NONE;
     group_attributes.stFrameRate.s32SrcFrameRate = -1;
@@ -171,38 +224,12 @@ bool MediaPipeline::InitialiseScaler() {
     }
     scaler_ready_ = true;
 
-    // Bind the group to a hardware unit before configuring any channel. The
-    // RV1106 has no dedicated VPSS block: scaling runs on RGA, and a group with
-    // no processing device accepts frames but never emits any. That produced the
-    // exact symptom this cost the most time on - VI reporting no dropped frames,
-    // VENC_GetStream returning only BUF_EMPTY, and hw_running staying 0, with no
-    // error logged anywhere. Every VPSS sample in the SDK sets this, without
-    // exception, immediately after CreateGrp.
-    result = RK_MPI_VPSS_SetVProcDev(kVpssGroup, VIDEO_PROC_DEV_RGA);
-    if (result != RK_SUCCESS) {
-        RK_LOGE("RK_MPI_VPSS_SetVProcDev(RGA) failed: %#x", result);
-        return false;
-    }
-
-    // Both are part of the SDK's own create sequence and both are cheap. Reset
-    // clears whatever state a previous process left in the group, which matters
-    // here because a crashed worker gets restarted rather than rebooting the board.
-    result = RK_MPI_VPSS_ResetGrp(kVpssGroup);
-    if (result != RK_SUCCESS) {
-        RK_LOGE("RK_MPI_VPSS_ResetGrp failed: %#x", result);
-        return false;
-    }
-
-    // Crop disabled explicitly rather than left at whatever the group defaults
-    // to; the samples always set it before enabling channels.
-    VPSS_CROP_INFO_S group_crop;
-    memset(&group_crop, 0, sizeof(group_crop));
-    group_crop.bEnable = RK_FALSE;
-    result = RK_MPI_VPSS_SetGrpCrop(kVpssGroup, &group_crop);
-    if (result != RK_SUCCESS) {
-        RK_LOGE("RK_MPI_VPSS_SetGrpCrop failed: %#x", result);
-        return false;
-    }
+    // Deliberately NOT calling SetVProcDev / ResetGrp / SetGrpCrop here. Those
+    // appear in the SDK's larger helper (SAMPLE_COMM_VPSS_CreateChn) but not in
+    // simple_vi_bind_vpss_bind_venc.c, which was verified working on this exact
+    // board: it goes straight from CreateGrp to SetChnAttr. Adding them did not
+    // fix the starvation and they are extra state to get wrong, so this follows
+    // the minimal sequence that is known to produce frames here.
 
     // Channel 0: full-rate output for the encoder.
     VPSS_CHN_ATTR_S encode_channel;
@@ -217,7 +244,10 @@ bool MediaPipeline::InitialiseScaler() {
     encode_channel.stFrameRate.s32DstFrameRate = -1;
 
     // Depth 0 for the same reason as VI: the consumer is a bound module, so no
-    // userspace queue should accumulate.
+    // userspace queue should accumulate. Raising this to 1 was tried and made
+    // things worse - zero frames instead of one, "mpp: select failed!", and RGA
+    // interrupts dropping from ~40/s to ~11/s. The "0, get fail" note in the SDK
+    // sample refers to userspace RK_MPI_*_GetChnFrame, not to bound delivery.
     encode_channel.u32Depth = 0;
 
     result = RK_MPI_VPSS_SetChnAttr(kVpssGroup, kVpssEncodeChannel, &encode_channel);
@@ -225,43 +255,16 @@ bool MediaPipeline::InitialiseScaler() {
         RK_LOGE("RK_MPI_VPSS_SetChnAttr(encode) failed: %#x", result);
         return false;
     }
+    // Enable VPSS encode channel BEFORE binding (SDK sample order)
     result = RK_MPI_VPSS_EnableChn(kVpssGroup, kVpssEncodeChannel);
     if (result != RK_SUCCESS) {
         RK_LOGE("RK_MPI_VPSS_EnableChn(encode) failed: %#x", result);
         return false;
     }
 
-    // Channel 1: downscaled and frame-rate limited for motion detection.
-    // Hardware fan-out is the point here: one VI stream feeds two consumers
-    // with no CPU involvement, which is the real single-producer/multi-consumer
-    // mechanism on this chip.
-    if (config_.enable_motion_detection) {
-        VPSS_CHN_ATTR_S detect_channel;
-        memset(&detect_channel, 0, sizeof(detect_channel));
-        detect_channel.enChnMode = VPSS_CHN_MODE_USER;
-        detect_channel.u32Width = AlignUpTo16(config_.detect_width);
-        detect_channel.u32Height = AlignUpTo16(config_.detect_height);
-        detect_channel.enPixelFormat = RK_FMT_YUV420SP;
-        detect_channel.enDynamicRange = DYNAMIC_RANGE_SDR8;
-        detect_channel.enCompressMode = COMPRESS_MODE_NONE;
-
-        // Motion detection gains nothing from 30fps. Dropping to 10 in hardware
-        // cuts IVS bandwidth to a third for free.
-        detect_channel.stFrameRate.s32SrcFrameRate = 30;
-        detect_channel.stFrameRate.s32DstFrameRate = 10;
-        detect_channel.u32Depth = 0;
-
-        result = RK_MPI_VPSS_SetChnAttr(kVpssGroup, kVpssDetectChannel, &detect_channel);
-        if (result != RK_SUCCESS) {
-            RK_LOGE("RK_MPI_VPSS_SetChnAttr(detect) failed: %#x", result);
-            return false;
-        }
-        result = RK_MPI_VPSS_EnableChn(kVpssGroup, kVpssDetectChannel);
-        if (result != RK_SUCCESS) {
-            RK_LOGE("RK_MPI_VPSS_EnableChn(detect) failed: %#x", result);
-            return false;
-        }
-    }
+    // Single-channel group on purpose. The detection path used to be VPSS
+    // channel 1, but adding it starved the encoder here, and IVS now takes its
+    // frames from VI channel 1 instead, so nothing else needs a VPSS channel.
 
     result = RK_MPI_VPSS_StartGrp(kVpssGroup);
     if (result != RK_SUCCESS) {
@@ -283,22 +286,20 @@ bool MediaPipeline::InitialiseEncoder() {
     encoder_attributes.stVencAttr.enPixelFormat = RK_FMT_YUV420SP;
     encoder_attributes.stVencAttr.u32PicWidth = config_.stream_width;
     encoder_attributes.stVencAttr.u32PicHeight = config_.stream_height;
-    // Align to 2, not 16. These describe the stride of the buffers VPSS hands
-    // over, and VPSS channel 0 is configured for exactly stream_width x
-    // stream_height. Rounding up to 16 here made the encoder expect 1088 rows
-    // for a 1080-row frame, and the VI driver then dropped every single frame
-    // with "frame info no equal set drop: frame [..1080], prep [..1088]". The
-    // SDK's own samples pass these through unaligned or via RK_ALIGN_2.
-    encoder_attributes.stVencAttr.u32VirWidth = AlignUpTo2(config_.stream_width);
-    encoder_attributes.stVencAttr.u32VirHeight = AlignUpTo2(config_.stream_height);
+    // Verbatim, no alignment. simple_vi_bind_vpss_bind_venc.c passes width and
+    // height straight through here and encodes fine on this board; align-16 was
+    // what caused the earlier "frame info no equal set drop" flood, and align-2
+    // is simply unnecessary for the even resolutions we use.
+    encoder_attributes.stVencAttr.u32VirWidth = config_.stream_width;
+    encoder_attributes.stVencAttr.u32VirHeight = config_.stream_height;
     encoder_attributes.stVencAttr.u32StreamBufCnt = 2;
 
-    // Compressed output only ever needs a fraction of a raw frame. Sizing this
-    // at width*height/2 rather than the raw 3/2 saves about 1.5 MB of the 66 MB
-    // CMA pool at 1080p, and the encoder reports overflow rather than
-    // corrupting if a pathological frame exceeds it.
+    // Full raw-frame size, matching every working SDK sample. The earlier
+    // w*h/2 was a bandwidth-saving guess: a single I frame at 1080p can exceed
+    // it, and an undersized stream buffer is one of the ways this pipeline
+    // silently delivers nothing instead of reporting an error.
     encoder_attributes.stVencAttr.u32BufSize =
-        config_.stream_width * config_.stream_height / 2;
+        config_.stream_width * config_.stream_height * 3 / 2;
 
     if (codec == RK_VIDEO_ID_AVC) {
         encoder_attributes.stVencAttr.u32Profile = 100;  // High profile
@@ -319,31 +320,10 @@ bool MediaPipeline::InitialiseEncoder() {
     }
     encoder_ready_ = true;
 
-    // Rate control parameters are mandatory even when using CBR; without them
-    // the hardware encoder never activates (hw_running stays 0). The SDK samples
-    // set QP ranges after CreateChn and before StartRecvFrame.
-    VENC_RC_PARAM_S rc_param;
-    memset(&rc_param, 0, sizeof(rc_param));
-    if (codec == RK_VIDEO_ID_AVC) {
-        rc_param.stParamH264.u32MinQp = 10;
-        rc_param.stParamH264.u32MaxQp = 51;
-        rc_param.stParamH264.u32MinIQp = 10;
-        rc_param.stParamH264.u32MaxIQp = 51;
-        rc_param.stParamH264.u32FrmMinQp = 28;
-        rc_param.stParamH264.u32FrmMinIQp = 28;
-    } else {
-        rc_param.stParamH265.u32MinQp = 10;
-        rc_param.stParamH265.u32MaxQp = 51;
-        rc_param.stParamH265.u32MinIQp = 10;
-        rc_param.stParamH265.u32MaxIQp = 51;
-        rc_param.stParamH265.u32FrmMinQp = 28;
-        rc_param.stParamH265.u32FrmMinIQp = 28;
-    }
-    result = RK_MPI_VENC_SetRcParam(kVencChannel, &rc_param);
-    if (result != RK_SUCCESS) {
-        RK_LOGE("RK_MPI_VENC_SetRcParam failed: %#x", result);
-        return false;
-    }
+    // simple_vi_bind_vpss_bind_venc.c does not call SetRcParam and encodes
+    // successfully. Omitting it to match the minimal working reference exactly;
+    // the QP ranges in stRcAttr.stH264Cbr / stH265Cbr are sufficient, and
+    // SetRcParam may trigger driver race conditions under certain bind topologies.
 
     VENC_RECV_PIC_PARAM_S receive_parameters;
     memset(&receive_parameters, 0, sizeof(receive_parameters));
@@ -371,10 +351,16 @@ bool MediaPipeline::InitialiseMotionDetector() {
     detector_attributes.bWeightpEnable = RK_FALSE;
     detector_attributes.bMDEnable = RK_TRUE;
 
-    // Analyse every other frame of the already-decimated 10fps channel, giving
-    // roughly 5 detections per second. Plenty for a sleeping infant, and it
-    // halves IVS load again.
-    detector_attributes.s32MDInterval = 2;
+    // The input is now the full sensor rate (~30fps) straight off VI channel 1,
+    // so this interval carries the decimation that VPSS's 30->10fps channel used
+    // to do: every 6th frame is ~5 analyses per second, the same effective rate
+    // as before, plenty for a sleeping infant.
+    //
+    // The decimation is done here rather than on the VI channel because
+    // VI_CHN_ATTR_S::stFrameRate is not usable for it on this board - the driver
+    // rejects the field (see the note in InitialiseVideoInput), and rkipc does
+    // not set it on VI channels either.
+    detector_attributes.s32MDInterval = 6;
     detector_attributes.bMDNightMode = RK_FALSE;
     detector_attributes.u32MDSensibility = config_.motion_sensitivity;
 
@@ -468,22 +454,25 @@ bool MediaPipeline::BindPipeline() {
     bound_vpss_to_venc_ = true;
 
     if (config_.enable_motion_detection) {
-        MPP_CHN_S scaler_detect_output;
-        scaler_detect_output.enModId = RK_ID_VPSS;
-        scaler_detect_output.s32DevId = kVpssGroup;
-        scaler_detect_output.s32ChnId = kVpssDetectChannel;
+        // Straight from the second VI channel, bypassing VPSS entirely: the ISP
+        // has already scaled this channel to detection resolution, so IVS needs
+        // no RGA pass and the encode path keeps the VPSS group to itself.
+        MPP_CHN_S detect_input_channel;
+        detect_input_channel.enModId = RK_ID_VI;
+        detect_input_channel.s32DevId = kViDevice;
+        detect_input_channel.s32ChnId = kViDetectChannel;
 
         MPP_CHN_S detector_channel;
         detector_channel.enModId = RK_ID_IVS;
         detector_channel.s32DevId = 0;
         detector_channel.s32ChnId = kIvsChannel;
 
-        result = RK_MPI_SYS_Bind(&scaler_detect_output, &detector_channel);
+        result = RK_MPI_SYS_Bind(&detect_input_channel, &detector_channel);
         if (result != RK_SUCCESS) {
-            RK_LOGE("Bind VPSS -> IVS failed: %#x", result);
+            RK_LOGE("Bind VI -> IVS failed: %#x", result);
             return false;
         }
-        bound_vpss_to_ivs_ = true;
+        bound_vi_to_ivs_ = true;
     }
 
     return true;
@@ -497,9 +486,13 @@ bool MediaPipeline::ForwardEncodedFrame() {
     memset(&stream_packet, 0, sizeof(stream_packet));
     encoded_stream.pstPack = &stream_packet;
 
-    // Short timeout instead of a blocking wait: the same loop also has to drain
-    // IVS results and refresh the heartbeat, so it must not park in one call.
-    RK_S32 result = RK_MPI_VENC_GetStream(kVencChannel, &encoded_stream, 20);
+    // 200 ms, matching the SDK's RTSP samples. The previous 20 ms was shorter
+    // than the 33 ms frame interval, so the call timed out and returned
+    // BUF_EMPTY before the encoder had any frame ready - the loop spun without
+    // ever collecting one. No SDK sample uses a timeout below 500; most block
+    // outright with -1. This is still bounded so the loop can service RTSP
+    // events and the heartbeat.
+    RK_S32 result = RK_MPI_VENC_GetStream(kVencChannel, &encoded_stream, 200000);
     if (result != RK_SUCCESS) {
         // An empty queue is routine. Anything else is remembered rather than
         // logged here, because this runs up to 50 times a second and a genuine
@@ -686,8 +679,8 @@ int MediaPipeline::Run() {
             frames_at_last_report = frames_forwarded_;
         }
 
-        // No sleep here on purpose. RK_MPI_VENC_GetStream blocks for up to 20ms
-        // when no frame is ready, which paces the loop and yields the core.
+        // No sleep here on purpose. RK_MPI_VENC_GetStream blocks until a frame
+        // is ready (or 200 ms elapse), which paces the loop and yields the core.
         // An unconditional usleep would add latency to every frame.
     }
 
@@ -698,11 +691,11 @@ int MediaPipeline::Run() {
 void MediaPipeline::TeardownBindings() {
     // Unbind in reverse order of binding: a downstream module must stop
     // receiving before its producer is torn down.
-    if (bound_vpss_to_ivs_) {
-        MPP_CHN_S source{RK_ID_VPSS, kVpssGroup, kVpssDetectChannel};
+    if (bound_vi_to_ivs_) {
+        MPP_CHN_S source{RK_ID_VI, kViDevice, kViDetectChannel};
         MPP_CHN_S destination{RK_ID_IVS, 0, kIvsChannel};
         RK_MPI_SYS_UnBind(&source, &destination);
-        bound_vpss_to_ivs_ = false;
+        bound_vi_to_ivs_ = false;
     }
 
     if (bound_vpss_to_venc_) {
@@ -743,10 +736,17 @@ void MediaPipeline::TeardownModules() {
 
     if (scaler_ready_) {
         RK_MPI_VPSS_StopGrp(kVpssGroup);
-        RK_MPI_VPSS_DisableChn(kVpssGroup, kVpssDetectChannel);
         RK_MPI_VPSS_DisableChn(kVpssGroup, kVpssEncodeChannel);
         RK_MPI_VPSS_DestroyGrp(kVpssGroup);
         scaler_ready_ = false;
+    }
+
+    // Before the video_input_ready_ block, not after: that one calls
+    // RK_MPI_VI_DisableDev, and disabling the device while channel 1 is still
+    // enabled leaves the driver holding a channel on a dead device.
+    if (detect_input_ready_) {
+        RK_MPI_VI_DisableChn(kViDevice, kViDetectChannel);
+        detect_input_ready_ = false;
     }
 
     if (video_input_ready_) {

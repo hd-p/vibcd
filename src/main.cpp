@@ -42,6 +42,8 @@ void PrintUsage(const char* program_name) {
     printf("      --motion-area <n>  moving area threshold in per-mille (default 20)\n");
     printf("      --no-motion        drop the IVS branch entirely, leaving\n");
     printf("                         VI -> VPSS -> VENC only\n");
+    printf("      --iqfiles <dir>    sensor tuning files for the ISP 3A loop\n");
+    printf("                         (default /etc/iqfiles; empty skips 3A)\n");
     printf("\nAudio:\n");
     printf("  -r, --rate <hz>        sample rate (default 16000)\n");
     printf("      --audio-card <hw>  capture card as hw:<card>,<device>\n");
@@ -74,6 +76,7 @@ enum LongOnlyOption {
     kOptionDetectResolution,
     kOptionMotionArea,
     kOptionNoMotion,
+    kOptionIqDir,
     kOptionCryModelPath,
     kOptionAudioCard,
     kOptionWatchdogDevice,
@@ -93,6 +96,7 @@ const struct option kLongOptions[] = {
     {"detect", required_argument, nullptr, kOptionDetectResolution},
     {"motion-area", required_argument, nullptr, kOptionMotionArea},
     {"no-motion", no_argument, nullptr, kOptionNoMotion},
+    {"iqfiles", required_argument, nullptr, kOptionIqDir},
     {"cry-model", required_argument, nullptr, kOptionCryModelPath},
     {"audio-card", required_argument, nullptr, kOptionAudioCard},
     {"watchdog", required_argument, nullptr, kOptionWatchdogDevice},
@@ -213,6 +217,10 @@ int main(int argc, char* argv[]) {
                 break;
             case kOptionNoMotion:
                 config.media.enable_motion_detection = false;
+                break;
+            case kOptionIqDir:
+                // Empty string skips the 3A loop; see the note in Initialise().
+                config.media.iq_file_dir = optarg;
                 break;
             case kOptionCryModelPath:
                 config.audio.cry_model_path = optarg;

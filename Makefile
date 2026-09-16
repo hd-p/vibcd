@@ -32,7 +32,8 @@ INCLUDES += -I$(RK_MEDIA_OUTPUT)/include/rkaiq/iq_parser_v2
 # c++17 is required, not a preference: std::atomic<>::is_always_lock_free and
 # inline static data members are both C++17, and the earlier -std=c++11 setting
 # could not compile either.
-CXXFLAGS := -std=c++17 -Wall -Wextra -O2 -g
+# CXXFLAGS := -std=c++17 -Wall -Wextra -O2 -
+CXXFLAGS := -std=c++17 -Wall -Wextra -g
 CXXFLAGS += -DRV1106 -DISP_HW_V30
 CXXFLAGS += $(INCLUDES)
 
