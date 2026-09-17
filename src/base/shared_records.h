@@ -1,8 +1,8 @@
 // Shared-memory records exchanged between processes.
 //
 // Every payload here is deliberately small. The video pixel data never appears
-// in shared memory: it travels VI -> VPSS -> {VENC, IVS} entirely inside the
-// media process through RK_MPI_SYS_Bind, so the hardware moves it and the CPU
+// in shared memory: it travels VI -> {VENC, IVS} entirely inside the media
+// process through RK_MPI_SYS_Bind, so the hardware moves it and the CPU
 // never copies it. What crosses a process boundary is only the *conclusions*:
 // motion rectangles, cry-detection verdicts, and periodic health counters.
 //

@@ -1,8 +1,8 @@
 // The media worker process: video chain, motion detection, heartbeat.
 //
-// Runs as a forked child of the supervisor. Owns VI, VPSS, VENC and IVS, so all
-// four bound channel handles live in one address space and frames never leave
-// the hardware. Publishes only conclusions (motion rectangles) to shared memory.
+// Runs as a forked child of the supervisor. Owns VI, VENC and IVS, so all three
+// bound channel handles live in one address space and frames never leave the
+// hardware. Publishes only conclusions (motion rectangles) to shared memory.
 
 #ifndef BABY_MONITOR_APP_MEDIA_SERVICE_H
 #define BABY_MONITOR_APP_MEDIA_SERVICE_H

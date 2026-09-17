@@ -4,7 +4,7 @@
 //
 //   baby_monitor (supervisor)  owns shared memory, reaps and restarts workers,
 //                              feeds /dev/watchdog
-//     |- baby_media            VI -> VPSS -> {VENC -> RTSP, IVS -> motion}
+//     |- baby_media            VI ch0 -> VENC -> RTSP, VI ch1 -> IVS -> motion
 //     +- baby_audio            AI -> AENC, plus the built-in cry detector
 //
 // Only the supervisor forks, so only the supervisor can reap. That is what makes
@@ -41,7 +41,7 @@ void PrintUsage(const char* program_name) {
     printf("      --detect <WxH>     IVS analysis resolution (default 640x360)\n");
     printf("      --motion-area <n>  moving area threshold in per-mille (default 20)\n");
     printf("      --no-motion        drop the IVS branch entirely, leaving\n");
-    printf("                         VI -> VPSS -> VENC only\n");
+    printf("                         VI ch0 -> VENC only\n");
     printf("      --iqfiles <dir>    sensor tuning files for the ISP 3A loop\n");
     printf("                         (default /etc/iqfiles; empty skips 3A)\n");
     printf("\nAudio:\n");
@@ -260,8 +260,8 @@ int main(int argc, char* argv[]) {
         config.media.stream_height = config.media.sensor_height;
     }
 
-    // VPSS scales the sensor image down into both branches, so neither output
-    // may exceed the source.
+    // The ISP scales each VI channel down from the sensor image, so neither
+    // channel may ask for more than the source.
     if (config.media.stream_width > config.media.sensor_width ||
         config.media.stream_height > config.media.sensor_height) {
         fprintf(stderr, "Stream %ux%u exceeds sensor %ux%u\n", config.media.stream_width,

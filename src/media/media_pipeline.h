@@ -1,6 +1,14 @@
-// Media pipeline: VI ch0 -> VPSS -> VENC -> RTSP, and VI ch1 -> IVS -> motion
-// rectangles. The fan-out is at VI, not at VPSS: two ISP outputs on one device
-// cost no scaler time, so the detection path never competes with the encoder.
+// Media pipeline: VI ch0 -> VENC -> RTSP, and VI ch1 -> IVS -> motion
+// rectangles. The fan-out is at VI: two ISP outputs on one device, each sized
+// by the ISP itself, so neither branch costs any scaler time and the detection
+// path never competes with the encoder.
+//
+// There is no VPSS anywhere in here. The RV1106 has no dedicated VPSS block -
+// scaling runs on RGA - so a group whose input and output are both
+// stream resolution was a pure 1:1 copy: ~186 MB/s of RGA traffic at 1080p30 to
+// reproduce the frame it was handed. Both vendor references for this topology
+// (simple_vi_bind_venc_rtsp.c and rkipc's rv1106_ipc) bind VI straight to VENC
+// and let the ISP do whatever scaling each consumer needs.
 //
 // Bound with RK_MPI_SYS_Bind, so pixels move between hardware blocks without
 // ever entering this process's address space. The CPU only handles encoded
@@ -28,7 +36,8 @@ struct MediaPipelineConfig {
     uint32_t sensor_width = 1920;
     uint32_t sensor_height = 1080;
 
-    // Encoder resolution. VPSS scales into this, so it may differ from sensor.
+    // Encoder resolution, and with it the size VI channel 0 is configured to
+    // deliver. The ISP scales into this, so it may differ from the sensor size.
     uint32_t stream_width = 1920;
     uint32_t stream_height = 1080;
 
@@ -45,7 +54,7 @@ struct MediaPipelineConfig {
     // Motion detection can be switched off entirely, which drops the second
     // VI channel and the IVS binding with it. Useful for isolating the video
     // path: if the encoder only produces frames with this disabled, the fault
-    // is in the fan-out rather than in VI or VENC.
+    // is in the fan-out rather than in the encode chain itself.
     bool enable_motion_detection = true;
 
     // IVS motion sensitivity, 1 = low, 2 = medium, 3 = high.
@@ -84,7 +93,6 @@ private:
     // and bound straight to IVS. Only called when motion detection is enabled.
     bool InitialiseDetectInput();
 
-    bool InitialiseScaler();
     bool InitialiseEncoder();
     bool InitialiseMotionDetector();
     bool InitialiseRtspServer();
@@ -106,28 +114,22 @@ private:
     EventChannel* event_channel_;
     HealthChannel* health_channel_;
 
-    // Fixed channel assignments. VI channel 0 carries the full-resolution
-    // stream into VPSS and on to the encoder; VI channel 1 is a second ISP
-    // output, scaled down, that feeds IVS directly. The detection path used to
-    // hang off VPSS channel 1, but a two-channel VPSS group starved the encoder
-    // on this board, and rkipc fans out at VI rather than at VPSS for exactly
-    // this reason.
+    // Fixed channel assignments. VI channel 0 delivers stream resolution
+    // straight to the encoder; VI channel 1 is a second ISP output, scaled
+    // down, that feeds IVS. Both are plain ISP outputs on one pipe, which is
+    // how rkipc drives its three channels too.
     static constexpr int kViDevice = 0;
     static constexpr int kViPipe = 0;
     static constexpr int kViChannel = 0;
     static constexpr int kViDetectChannel = 1;
-    static constexpr int kVpssGroup = 0;
-    static constexpr int kVpssEncodeChannel = 0;
     static constexpr int kVencChannel = 0;
     static constexpr int kIvsChannel = 0;
 
     bool video_input_ready_ = false;
     bool detect_input_ready_ = false;
-    bool scaler_ready_ = false;
     bool encoder_ready_ = false;
     bool motion_detector_ready_ = false;
-    bool bound_vi_to_vpss_ = false;
-    bool bound_vpss_to_venc_ = false;
+    bool bound_vi_to_venc_ = false;
     bool bound_vi_to_ivs_ = false;
 
     // Declared before the MPI state so it is destroyed last: the 3A loop must
