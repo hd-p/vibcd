@@ -8,6 +8,7 @@
 #include "app/hardware_watchdog.h"
 #include "app/media_service.h"
 #include "base/child_process.h"
+#include "base/plain_log.h"
 #include "base/rk_platform.h"
 #include "base/shared_memory.h"
 #include "base/shared_records.h"
@@ -83,24 +84,24 @@ bool CreateChannels(SharedMemory<EventChannel>* event_channel,
     SharedMemory<HealthChannel>::Unlink(kHealthChannelName);
 
     if (!event_channel->Create(kEventChannelName)) {
-        RK_LOGE("Could not create %s", kEventChannelName);
+        PLAIN_LOGE("Could not create %s", kEventChannelName);
         return false;
     }
     if (!InitialiseSharedMutex(&(*event_channel)->lock)) {
-        RK_LOGE("Could not initialise the event channel mutex");
+        PLAIN_LOGE("Could not initialise the event channel mutex");
         return false;
     }
 
     if (!health_channel->Create(kHealthChannelName)) {
-        RK_LOGE("Could not create %s", kHealthChannelName);
+        PLAIN_LOGE("Could not create %s", kHealthChannelName);
         return false;
     }
     if (!InitialiseSharedMutex(&(*health_channel)->lock)) {
-        RK_LOGE("Could not initialise the health channel mutex");
+        PLAIN_LOGE("Could not initialise the health channel mutex");
         return false;
     }
 
-    RK_LOGI("Shared channels ready: events %zu bytes, health %zu bytes",
+    PLAIN_LOGI("Shared channels ready: events %zu bytes, health %zu bytes",
             sizeof(EventChannel), sizeof(HealthChannel));
     return true;
 }
@@ -119,13 +120,13 @@ int RunSingleService(const SupervisorConfig& config, MonitoredProcess service) {
 
     switch (service) {
         case MonitoredProcess::MEDIA:
-            RK_LOGI("Running baby_media in this process (no fork, no watchdog)");
+            PLAIN_LOGI("Running baby_media in this process (no fork, no watchdog)");
             return RunMediaService(config.media);
         case MonitoredProcess::AUDIO:
-            RK_LOGI("Running baby_audio in this process (no fork, no watchdog)");
+            PLAIN_LOGI("Running baby_audio in this process (no fork, no watchdog)");
             return RunAudioService(config.audio);
         default:
-            RK_LOGE("Not a runnable service");
+            PLAIN_LOGE("Not a runnable service");
             return 1;
     }
 }
@@ -165,7 +166,7 @@ int RunSupervisor(const SupervisorConfig& config) {
     for (SupervisedWorker& worker : workers) {
         worker.last_progress_us = startup_us;
         if (!worker.process.Start()) {
-            RK_LOGE("Could not start %s", worker.process.name().c_str());
+            PLAIN_LOGE("Could not start %s", worker.process.name().c_str());
         }
     }
 
@@ -190,7 +191,7 @@ int RunSupervisor(const SupervisorConfig& config) {
             bool restart_needed = false;
 
             if (!running) {
-                RK_LOGE("%s exited with status %d", worker.process.name().c_str(),
+                PLAIN_LOGE("%s exited with status %d", worker.process.name().c_str(),
                         worker.process.last_exit_status());
                 restart_needed = true;
             } else {
@@ -204,7 +205,7 @@ int RunSupervisor(const SupervisorConfig& config) {
                                config.heartbeat_timeout_us) {
                         // The process exists but its loop stopped advancing.
                         // This is precisely the failure a pid check cannot see.
-                        RK_LOGE("%s is alive but its heartbeat stalled for %llu ms",
+                        PLAIN_LOGE("%s is alive but its heartbeat stalled for %llu ms",
                                 worker.process.name().c_str(),
                                 static_cast<unsigned long long>(
                                     (now_us - worker.last_progress_us) / 1000));
@@ -219,7 +220,7 @@ int RunSupervisor(const SupervisorConfig& config) {
             }
 
             if (worker.process.restart_count() >= config.max_restarts) {
-                RK_LOGE("%s failed %d times; giving up on it",
+                PLAIN_LOGE("%s failed %d times; giving up on it",
                         worker.process.name().c_str(), worker.process.restart_count());
                 worker.abandoned = true;
                 continue;
@@ -231,10 +232,10 @@ int RunSupervisor(const SupervisorConfig& config) {
             worker.last_progress_us = now_us;
 
             if (worker.process.Start()) {
-                RK_LOGI("Restarted %s (attempt %d of %d)", worker.process.name().c_str(),
+                PLAIN_LOGI("Restarted %s (attempt %d of %d)", worker.process.name().c_str(),
                         worker.process.restart_count(), config.max_restarts);
             } else {
-                RK_LOGE("Could not restart %s", worker.process.name().c_str());
+                PLAIN_LOGE("Could not restart %s", worker.process.name().c_str());
             }
         }
 
@@ -244,7 +245,7 @@ int RunSupervisor(const SupervisorConfig& config) {
         watchdog.Feed();
     }
 
-    RK_LOGI("Supervisor stopping workers");
+    PLAIN_LOGI("Supervisor stopping workers");
 
     // Disarm the dog first: stopping the workers takes seconds, and an armed
     // watchdog would reboot the board partway through a deliberate shutdown.
@@ -254,7 +255,7 @@ int RunSupervisor(const SupervisorConfig& config) {
         worker.process.Stop();
     }
 
-    RK_LOGI("Supervisor stopped");
+    PLAIN_LOGI("Supervisor stopped");
     return 0;
 }
 

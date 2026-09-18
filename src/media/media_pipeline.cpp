@@ -34,6 +34,8 @@ MediaPipeline::MediaPipeline(const MediaPipelineConfig& config,
     : config_(config), event_channel_(event_channel), health_channel_(health_channel) {}
 
 MediaPipeline::~MediaPipeline() {
+    // Threads first: they hold the channel handles the teardown destroys.
+    StopThreads();
     TeardownBindings();
     TeardownModules();
 }
@@ -405,19 +407,17 @@ bool MediaPipeline::ForwardEncodedFrame() {
     memset(&stream_packet, 0, sizeof(stream_packet));
     encoded_stream.pstPack = &stream_packet;
 
-    // 200 ms, matching the SDK's RTSP samples. The previous 20 ms was shorter
-    // than the 33 ms frame interval, so the call timed out and returned
-    // BUF_EMPTY before the encoder had any frame ready - the loop spun without
-    // ever collecting one. No SDK sample uses a timeout below 500; most block
-    // outright with -1. This is still bounded so the loop can service RTSP
-    // events and the heartbeat.
-    RK_S32 result = RK_MPI_VENC_GetStream(kVencChannel, &encoded_stream, 200000);
+    // Bounded rather than -1: the encoder thread must notice stop_threads_
+    // within a fraction of a second, and this is longer than a frame interval
+    // so a healthy encoder never times out. (An earlier 20 ms was shorter than
+    // the 33 ms frame interval and returned BUF_EMPTY before any frame existed.)
+    RK_S32 result = RK_MPI_VENC_GetStream(kVencChannel, &encoded_stream, 200);
     if (result != RK_SUCCESS) {
         // An empty queue is routine. Anything else is remembered rather than
-        // logged here, because this runs up to 50 times a second and a genuine
-        // fault would drown the log; Run() reports it with the frame stats.
+        // logged here, because this runs 30 times a second and a genuine fault
+        // would drown the log; Run() reports it with the frame stats.
         if (result != RK_ERR_VENC_BUF_EMPTY) {
-            last_getstream_error_ = result;
+            last_getstream_error_.store(result, std::memory_order_relaxed);
         }
         return result == RK_ERR_VENC_BUF_EMPTY;
     }
@@ -434,9 +434,9 @@ bool MediaPipeline::ForwardEncodedFrame() {
     if (payload != nullptr && rtsp_session_ != nullptr && stream_packet.u32Len > 0) {
         rtsp_tx_video(rtsp_session_, static_cast<const uint8_t*>(payload),
                       static_cast<int>(stream_packet.u32Len), stream_packet.u64PTS);
-        ++frames_forwarded_;
+        frames_forwarded_.fetch_add(1, std::memory_order_relaxed);
     } else {
-        ++frames_dropped_;
+        frames_dropped_.fetch_add(1, std::memory_order_relaxed);
     }
 
     RK_S32 release_result = RK_MPI_VENC_ReleaseStream(kVencChannel, &encoded_stream);
@@ -452,14 +452,15 @@ void MediaPipeline::PublishMotionResults() {
     IVS_RESULT_INFO_S results;
     memset(&results, 0, sizeof(results));
 
-    // Zero timeout: poll and move on. The encoder path must not stall waiting
-    // for detection results.
-    RK_S32 result = RK_MPI_IVS_GetResults(kIvsChannel, &results, 0);
+    // Bounded wait, same reasoning as GetStream. Note that a timeout of 0 did
+    // NOT poll on this SDK: it blocked until the next result anyway, which is
+    // how this call ended up pacing the encoder before the split into threads.
+    RK_S32 result = RK_MPI_IVS_GetResults(kIvsChannel, &results, 500);
     if (result != RK_SUCCESS) {
-        last_ivs_error_ = result;
+        last_ivs_error_.store(result, std::memory_order_relaxed);
         return;
     }
-    ++ivs_results_;
+    ivs_results_.fetch_add(1, std::memory_order_relaxed);
 
     if (results.s32ResultNum > 0 && results.pstResults != nullptr) {
         const IVS_MD_INFO_S& motion_info = results.pstResults->stMdInfo;
@@ -517,7 +518,7 @@ void MediaPipeline::PublishMotionResults() {
         }
 
         if (event.motion_present) {
-            ++ivs_motion_results_;
+            ivs_motion_results_.fetch_add(1, std::memory_order_relaxed);
         }
         // Log transitions only, so a moving scene does not flood the log at
         // five results a second.
@@ -549,11 +550,61 @@ void MediaPipeline::PublishHeartbeat() {
     beat.updated_at_us = MonotonicMicroseconds();
 }
 
+void MediaPipeline::EncoderLoop() {
+    while (!stop_threads_.load(std::memory_order_relaxed)) {
+        ForwardEncodedFrame();
+
+        // Every iteration, not just after a frame: this services the RTSP
+        // control channel (OPTIONS/DESCRIBE/SETUP/PLAY). Serviced only per
+        // frame, a client could not even complete the handshake while the
+        // encoder was starved, which made a stalled encoder look like a broken
+        // server. GetStream's timeout bounds the gap between calls.
+        if (rtsp_server_ != nullptr) {
+            rtsp_do_event(rtsp_server_);
+        }
+    }
+}
+
+void MediaPipeline::DetectorLoop() {
+    while (!stop_threads_.load(std::memory_order_relaxed)) {
+        PublishMotionResults();
+    }
+}
+
+void MediaPipeline::StopThreads() {
+    stop_threads_.store(true, std::memory_order_relaxed);
+    if (encoder_thread_.joinable()) {
+        encoder_thread_.join();
+    }
+    if (detector_thread_.joinable()) {
+        detector_thread_.join();
+    }
+}
+
 int MediaPipeline::Run() {
     signal(SIGTERM, HandleStopSignal);
     signal(SIGINT, HandleStopSignal);
 
-    RK_LOGI("Media pipeline running");
+    // Block the stop signals in the worker threads so the handler always runs
+    // on this thread. Threads inherit the mask at creation, so set it before
+    // starting them and restore it afterwards.
+    sigset_t stop_signals;
+    sigemptyset(&stop_signals);
+    sigaddset(&stop_signals, SIGTERM);
+    sigaddset(&stop_signals, SIGINT);
+    sigset_t previous_mask;
+    pthread_sigmask(SIG_BLOCK, &stop_signals, &previous_mask);
+
+    stop_threads_.store(false, std::memory_order_relaxed);
+    encoder_thread_ = std::thread([this]() { EncoderLoop(); });
+    if (config_.enable_motion_detection) {
+        detector_thread_ = std::thread([this]() { DetectorLoop(); });
+    }
+
+    pthread_sigmask(SIG_SETMASK, &previous_mask, nullptr);
+
+    RK_LOGI("Media pipeline running (encoder thread%s)",
+            config_.enable_motion_detection ? " + detector thread" : "");
 
     uint64_t last_heartbeat_us = 0;
     constexpr uint64_t kHeartbeatIntervalUs = 1000000;
@@ -566,19 +617,9 @@ int MediaPipeline::Run() {
     uint64_t frames_at_last_report = 0;
 
     while (g_stop_requested == 0) {
-        ForwardEncodedFrame();
-        if (config_.enable_motion_detection) {
-            PublishMotionResults();
-        }
-
-        // Unconditionally, not just after a frame: this is what services the
-        // RTSP control channel (OPTIONS/DESCRIBE/SETUP/PLAY). Calling it only
-        // when a frame arrives means a client cannot even complete the handshake
-        // while the encoder is starved, which leaves its connection sitting in
-        // CLOSE_WAIT and makes a stalled encoder look like a broken server.
-        if (rtsp_server_ != nullptr) {
-            rtsp_do_event(rtsp_server_);
-        }
+        // Nothing here blocks on hardware, so a plain sleep paces the loop.
+        // 100 ms keeps shutdown responsive without measurable CPU cost.
+        usleep(100000);
 
         const uint64_t now_us = MonotonicMicroseconds();
         if (now_us - last_heartbeat_us >= kHeartbeatIntervalUs) {
@@ -590,7 +631,9 @@ int MediaPipeline::Run() {
         // and "no client" are indistinguishable from the outside.
         if (now_us - last_report_us >= kStatsIntervalUs) {
             const uint64_t elapsed_us = now_us - last_report_us;
-            const uint64_t frames = frames_forwarded_ - frames_at_last_report;
+            const uint64_t forwarded = frames_forwarded_.load(std::memory_order_relaxed);
+            const uint64_t dropped = frames_dropped_.load(std::memory_order_relaxed);
+            const uint64_t frames = forwarded - frames_at_last_report;
             const unsigned fps =
                 static_cast<unsigned>(frames * 1000000 / (elapsed_us ? elapsed_us : 1));
 
@@ -599,31 +642,30 @@ int MediaPipeline::Run() {
                         "last error %#x, %llu packets dropped); check that VI is "
                         "streaming",
                         static_cast<unsigned long long>(elapsed_us / 1000000),
-                        last_getstream_error_,
-                        static_cast<unsigned long long>(frames_dropped_));
+                        last_getstream_error_.load(std::memory_order_relaxed),
+                        static_cast<unsigned long long>(dropped));
             } else {
                 RK_LOGI("Video: %llu frames forwarded, ~%u fps, %llu dropped",
-                        static_cast<unsigned long long>(frames_forwarded_), fps,
-                        static_cast<unsigned long long>(frames_dropped_));
+                        static_cast<unsigned long long>(forwarded), fps,
+                        static_cast<unsigned long long>(dropped));
             }
             if (config_.enable_motion_detection) {
                 RK_LOGI("IVS: %llu results (%llu with motion), GetResults last "
                         "error %#x",
-                        static_cast<unsigned long long>(ivs_results_),
-                        static_cast<unsigned long long>(ivs_motion_results_),
-                        last_ivs_error_);
+                        static_cast<unsigned long long>(
+                            ivs_results_.load(std::memory_order_relaxed)),
+                        static_cast<unsigned long long>(
+                            ivs_motion_results_.load(std::memory_order_relaxed)),
+                        last_ivs_error_.load(std::memory_order_relaxed));
             }
 
             last_report_us = now_us;
-            frames_at_last_report = frames_forwarded_;
+            frames_at_last_report = forwarded;
         }
-
-        // No sleep here on purpose. RK_MPI_VENC_GetStream blocks until a frame
-        // is ready (or 200 ms elapse), which paces the loop and yields the core.
-        // An unconditional usleep would add latency to every frame.
     }
 
     RK_LOGI("Media pipeline stopping");
+    StopThreads();
     return 0;
 }
 

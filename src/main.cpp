@@ -16,11 +16,14 @@
 
 #include <getopt.h>
 
+#include <csignal>
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
 #include "app/supervisor.h"
+#include "base/plain_log.h"
 #include "base/rk_platform.h"
 #include "base/shared_records.h"
 
@@ -131,6 +134,14 @@ int main(int argc, char* argv[]) {
     // the buffer entirely. The SDK's own samples call setlinebuf for this.
     setlinebuf(stdout);
     setlinebuf(stderr);
+
+    // Before fork, so every worker inherits it. A viewer that disconnects
+    // mid-stream leaves librtsp writing to a closed TCP socket; the kernel
+    // answers with SIGPIPE, whose default action killed the whole media worker
+    // (exit status -13) on every client teardown. Ignored, the write simply
+    // fails with EPIPE and librtsp drops that client, which is what its own
+    // "send ... failed: Connection reset by peer" path already handles.
+    signal(SIGPIPE, SIG_IGN);
 
     baby_monitor::SupervisorConfig config;
     config.audio.cry_model_path = "/oem/usr/share/vqefiles/rkaudio_model_sed_bcd.rknn";
@@ -277,15 +288,15 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    RK_LOGI("Sensor %ux%u, stream %ux%u @%u kbps %s", config.media.sensor_width,
+    PLAIN_LOGI("Sensor %ux%u, stream %ux%u @%u kbps %s", config.media.sensor_width,
             config.media.sensor_height, config.media.stream_width,
             config.media.stream_height, config.media.bitrate_kbps,
             config.media.use_h265 ? "H.265" : "H.264");
-    RK_LOGI("Motion %ux%u, sensitivity %u, threshold %u per-mille",
+    PLAIN_LOGI("Motion %ux%u, sensitivity %u, threshold %u per-mille",
             config.media.detect_width, config.media.detect_height,
             config.media.motion_sensitivity,
             config.media.motion_area_threshold_permille);
-    RK_LOGI("Audio %u Hz x%u, %u samples per frame, card %s", config.audio.sample_rate,
+    PLAIN_LOGI("Audio %u Hz x%u, %u samples per frame, card %s", config.audio.sample_rate,
             config.audio.channel_count, config.audio.samples_per_frame,
             config.audio.capture_card_name.empty()
                 ? "(by index)"

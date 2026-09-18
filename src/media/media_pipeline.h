@@ -23,8 +23,10 @@
 #ifndef BABY_MONITOR_MEDIA_MEDIA_PIPELINE_H
 #define BABY_MONITOR_MEDIA_MEDIA_PIPELINE_H
 
+#include <atomic>
 #include <cstdint>
 #include <string>
+#include <thread>
 
 #include "base/rk_platform.h"
 #include "base/shared_records.h"
@@ -101,14 +103,35 @@ private:
     void TeardownBindings();
     void TeardownModules();
 
+    // Threading model: one blocking SDK source per thread.
+    //
+    // RK_MPI_VENC_GetStream and RK_MPI_IVS_GetResults each block until their
+    // hardware has something, at different rates (30/s vs 5/s). Polling both
+    // from one loop let the slower call pace the faster one: the encoder ran
+    // at IVS rate and its ring buffer overflowed. So each gets its own thread
+    // that does nothing but wait, handle, publish. The main thread only sleeps,
+    // beats the heartbeat and prints statistics.
+    //
+    // Ownership, which is what makes this lock-free between threads:
+    //   encoder thread  owns the VENC channel and the RTSP session
+    //                   (rtsp_tx_video and rtsp_do_event are both called here,
+    //                   as in the SDK sample, so librtsp is single-threaded)
+    //   detector thread owns the IVS channel and the motion mailbox write side
+    //   main thread     owns the heartbeat and only reads the atomic counters
+    void EncoderLoop();
+    void DetectorLoop();
+
     // Moves one encoded frame from VENC to the RTSP session. Returns false only
     // on an error worth logging; an empty queue is a normal outcome.
     bool ForwardEncodedFrame();
 
-    // Drains IVS results and republishes a verdict to shared memory.
+    // Drains one IVS result and republishes a verdict to shared memory.
     void PublishMotionResults();
 
     void PublishHeartbeat();
+
+    // Signals the worker threads and joins them. Safe to call twice.
+    void StopThreads();
 
     MediaPipelineConfig config_;
     EventChannel* event_channel_;
@@ -139,23 +162,31 @@ private:
     rtsp_demo_handle rtsp_server_ = nullptr;
     rtsp_session_handle rtsp_session_ = nullptr;
 
+    // Detector-thread private state.
     uint64_t published_motion_sequence_ = 0;
+    bool last_motion_present_ = false;
+
+    // Main-thread private state.
     uint64_t heartbeat_counter_ = 0;
 
-    // Frames handed to the RTSP session since start, and the last non-empty
-    // GetStream error. Both exist so Run() can report throughput periodically
-    // instead of logging per frame: "no video" and "video but no client" look
-    // identical from outside otherwise.
-    uint64_t frames_forwarded_ = 0;
-    uint64_t frames_dropped_ = 0;
-    int32_t last_getstream_error_ = 0;
+    std::thread encoder_thread_;
+    std::thread detector_thread_;
 
-    // Same idea for the detection path: GetResults failures are silent per
-    // call, so the periodic report is the only place they become visible.
-    uint64_t ivs_results_ = 0;
-    uint64_t ivs_motion_results_ = 0;
-    int32_t last_ivs_error_ = 0;
-    bool last_motion_present_ = false;
+    // Cross-thread stop flag. Distinct from the sig_atomic_t the signal
+    // handler sets: that one is only safe from a handler, this one is only
+    // safe between threads.
+    std::atomic<bool> stop_threads_{false};
+
+    // Written by the worker threads, read by the main thread's periodic
+    // report. Single words, so atomics rather than a lock. They exist so Run()
+    // can report throughput periodically instead of logging per frame: "no
+    // video" and "video but no client" look identical from outside otherwise.
+    std::atomic<uint64_t> frames_forwarded_{0};
+    std::atomic<uint64_t> frames_dropped_{0};
+    std::atomic<int32_t> last_getstream_error_{0};
+    std::atomic<uint64_t> ivs_results_{0};
+    std::atomic<uint64_t> ivs_motion_results_{0};
+    std::atomic<int32_t> last_ivs_error_{0};
 };
 
 }  // namespace baby_monitor

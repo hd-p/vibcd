@@ -9,6 +9,7 @@
 
 #include <utility>
 
+#include "base/plain_log.h"
 #include "base/rk_platform.h"
 
 namespace baby_monitor {
@@ -43,7 +44,7 @@ bool ChildProcess::Start() {
 
     pid_t forked = fork();
     if (forked < 0) {
-        RK_LOGE("fork() for %s failed: %d", name_.c_str(), errno);
+        PLAIN_LOGE("fork() for %s failed: %d", name_.c_str(), errno);
         return false;
     }
 
@@ -59,7 +60,7 @@ bool ChildProcess::Start() {
         // then fails to initialise all three, and it looks like broken hardware
         // rather than a leftover process.
         if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0) {
-            RK_LOGW("PR_SET_PDEATHSIG for %s failed: %d", name_.c_str(), errno);
+            PLAIN_LOGW("PR_SET_PDEATHSIG for %s failed: %d", name_.c_str(), errno);
         }
 
         // The parent can exit between the fork and the prctl above. PDEATHSIG
@@ -91,7 +92,7 @@ bool ChildProcess::Start() {
 
     pid_ = forked;
     state_ = ChildState::RUNNING;
-    RK_LOGI("Started %s as pid %d", name_.c_str(), static_cast<int>(pid_));
+    PLAIN_LOGI("Started %s as pid %d", name_.c_str(), static_cast<int>(pid_));
     return true;
 }
 
@@ -129,12 +130,12 @@ bool ChildProcess::PollLiveness() {
     if (waited < 0) {
         if (errno == ECHILD) {
             // Not our child, or already reaped elsewhere. Either way it is gone.
-            RK_LOGW("waitpid(%s) reports no such child", name_.c_str());
+            PLAIN_LOGW("waitpid(%s) reports no such child", name_.c_str());
             state_ = ChildState::EXITED;
             pid_ = -1;
             return false;
         }
-        RK_LOGE("waitpid(%s) failed: %d", name_.c_str(), errno);
+        PLAIN_LOGE("waitpid(%s) failed: %d", name_.c_str(), errno);
         return true;
     }
 
@@ -170,7 +171,7 @@ void ChildProcess::Stop(int grace_period_ms) {
         pid_t waited = waitpid(target, &wait_status, WNOHANG);
         if (waited == target) {
             ReapInto(wait_status);
-            RK_LOGI("Stopped %s cleanly", name_.c_str());
+            PLAIN_LOGI("Stopped %s cleanly", name_.c_str());
             return;
         }
         if (waited < 0 && errno == ECHILD) {
@@ -182,7 +183,7 @@ void ChildProcess::Stop(int grace_period_ms) {
         waited_ms += poll_interval_ms;
     }
 
-    RK_LOGW("%s ignored SIGTERM after %d ms; sending SIGKILL", name_.c_str(),
+    PLAIN_LOGW("%s ignored SIGTERM after %d ms; sending SIGKILL", name_.c_str(),
             grace_period_ms);
     kill(target, SIGKILL);
 
