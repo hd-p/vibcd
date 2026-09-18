@@ -147,7 +147,15 @@ private:
     // instead of logging per frame: "no video" and "video but no client" look
     // identical from outside otherwise.
     uint64_t frames_forwarded_ = 0;
+    uint64_t frames_dropped_ = 0;
     int32_t last_getstream_error_ = 0;
+
+    // Same idea for the detection path: GetResults failures are silent per
+    // call, so the periodic report is the only place they become visible.
+    uint64_t ivs_results_ = 0;
+    uint64_t ivs_motion_results_ = 0;
+    int32_t last_ivs_error_ = 0;
+    bool last_motion_present_ = false;
 };
 
 }  // namespace baby_monitor

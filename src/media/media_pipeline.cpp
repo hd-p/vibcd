@@ -422,20 +422,21 @@ bool MediaPipeline::ForwardEncodedFrame() {
         return result == RK_ERR_VENC_BUF_EMPTY;
     }
 
+    // The MB handle already resolves to the start of this packet's payload;
+    // u32Len is the whole packet. u32Offset is NOT an offset to apply here: on
+    // rockit it reports the packet's position inside the encoder's ring buffer
+    // (megabytes), so subtracting it from u32Len went negative and every frame
+    // was silently dropped, except once per ring wrap when the offset happened
+    // to be smaller than the frame and a misaligned pointer was sent instead
+    // ("not found nal header"). simple_vi_bind_venc_rtsp.c and rkipc both send
+    // Handle2VirAddr + u32Len and never touch u32Offset.
     void* payload = RK_MPI_MB_Handle2VirAddr(stream_packet.pMbBlk);
-    if (payload != nullptr && rtsp_session_ != nullptr) {
-        // u32Offset skips any header padding the encoder inserted; sending from
-        // the buffer start would prepend garbage to the frame.
-        const uint8_t* frame_bytes =
-            static_cast<const uint8_t*>(payload) + stream_packet.u32Offset;
-        const int frame_length =
-            static_cast<int>(stream_packet.u32Len - stream_packet.u32Offset);
-
-        if (frame_length > 0) {
-            rtsp_tx_video(rtsp_session_, frame_bytes, frame_length,
-                          stream_packet.u64PTS);
-            ++frames_forwarded_;
-        }
+    if (payload != nullptr && rtsp_session_ != nullptr && stream_packet.u32Len > 0) {
+        rtsp_tx_video(rtsp_session_, static_cast<const uint8_t*>(payload),
+                      static_cast<int>(stream_packet.u32Len), stream_packet.u64PTS);
+        ++frames_forwarded_;
+    } else {
+        ++frames_dropped_;
     }
 
     RK_S32 release_result = RK_MPI_VENC_ReleaseStream(kVencChannel, &encoded_stream);
@@ -455,8 +456,10 @@ void MediaPipeline::PublishMotionResults() {
     // for detection results.
     RK_S32 result = RK_MPI_IVS_GetResults(kIvsChannel, &results, 0);
     if (result != RK_SUCCESS) {
+        last_ivs_error_ = result;
         return;
     }
+    ++ivs_results_;
 
     if (results.s32ResultNum > 0 && results.pstResults != nullptr) {
         const IVS_MD_INFO_S& motion_info = results.pstResults->stMdInfo;
@@ -514,9 +517,16 @@ void MediaPipeline::PublishMotionResults() {
         }
 
         if (event.motion_present) {
-            RK_LOGD("Motion: frame %u, %u rect(s), area %u/%u", event.frame_id,
+            ++ivs_motion_results_;
+        }
+        // Log transitions only, so a moving scene does not flood the log at
+        // five results a second.
+        if (event.motion_present != last_motion_present_) {
+            RK_LOGI("Motion %s: frame %u, %u rect(s), area %u/%u",
+                    event.motion_present ? "started" : "ended", event.frame_id,
                     event.rectangle_count, event.moving_pixel_area,
                     event.frame_pixel_area);
+            last_motion_present_ = event.motion_present;
         }
     }
 
@@ -586,12 +596,22 @@ int MediaPipeline::Run() {
 
             if (frames == 0) {
                 RK_LOGW("No encoded frames in the last %llu s (VENC GetStream "
-                        "last error %#x); check that VI is streaming",
+                        "last error %#x, %llu packets dropped); check that VI is "
+                        "streaming",
                         static_cast<unsigned long long>(elapsed_us / 1000000),
-                        last_getstream_error_);
+                        last_getstream_error_,
+                        static_cast<unsigned long long>(frames_dropped_));
             } else {
-                RK_LOGI("Video: %llu frames forwarded, ~%u fps",
-                        static_cast<unsigned long long>(frames_forwarded_), fps);
+                RK_LOGI("Video: %llu frames forwarded, ~%u fps, %llu dropped",
+                        static_cast<unsigned long long>(frames_forwarded_), fps,
+                        static_cast<unsigned long long>(frames_dropped_));
+            }
+            if (config_.enable_motion_detection) {
+                RK_LOGI("IVS: %llu results (%llu with motion), GetResults last "
+                        "error %#x",
+                        static_cast<unsigned long long>(ivs_results_),
+                        static_cast<unsigned long long>(ivs_motion_results_),
+                        last_ivs_error_);
             }
 
             last_report_us = now_us;
