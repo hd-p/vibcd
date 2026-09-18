@@ -77,6 +77,13 @@ bool MediaPipeline::Initialise() {
     if (!InitialiseRtspServer()) return false;
     if (!BindPipeline()) return false;
 
+    // After the encoder exists, before frames matter. A failure here is
+    // logged and tolerated: the stream is more important than the boxes.
+    if (config_.enable_overlay &&
+        !overlay_.Attach(kVencChannel, config_.stream_width, config_.stream_height)) {
+        RK_LOGW("Overlay unavailable; streaming without on-screen boxes");
+    }
+
     if (config_.enable_motion_detection) {
         RK_LOGI("Media pipeline ready: VI ch0 %ux%u -> VENC, VI ch1 %ux%u -> IVS",
                 config_.stream_width, config_.stream_height, config_.detect_width,
@@ -571,6 +578,79 @@ void MediaPipeline::DetectorLoop() {
     }
 }
 
+void MediaPipeline::OverlayLoop() {
+    // Redraw only on change: a new motion sequence, a new cry sequence, or the
+    // motion hold expiring. Polling the mailboxes at 10 Hz is far cheaper than
+    // a redraw and keeps the boxes within 100 ms of the verdict.
+    uint64_t seen_motion_sequence = 0;
+    uint64_t seen_cry_sequence = 0;
+    MotionEvent motion;
+    memset(&motion, 0, sizeof(motion));
+    bool motion_shown = false;
+    bool crying = false;
+    uint64_t motion_shown_since_us = 0;
+
+    // What the canvas currently shows, to skip redraws that change nothing.
+    MotionEvent drawn_motion;
+    memset(&drawn_motion, 0, sizeof(drawn_motion));
+    bool drawn_motion_shown = false;
+    bool drawn_crying = false;
+
+    while (!stop_threads_.load(std::memory_order_relaxed)) {
+        usleep(100000);
+
+        bool changed = false;
+        if (event_channel_ != nullptr) {
+            // Copy out under the lock, draw outside it. RGN calls can take a
+            // few hundred microseconds and must never hold up the producers.
+            SharedMutexGuard guard(&event_channel_->lock);
+            if (guard.locked()) {
+                if (event_channel_->motion_sequence != seen_motion_sequence) {
+                    seen_motion_sequence = event_channel_->motion_sequence;
+                    motion = event_channel_->motion;
+                    changed = true;
+                }
+                if (event_channel_->cry_sequence != seen_cry_sequence) {
+                    seen_cry_sequence = event_channel_->cry_sequence;
+                    crying = event_channel_->cry.baby_crying;
+                    changed = true;
+                }
+            }
+        }
+
+        const uint64_t now_us = MonotonicMicroseconds();
+        if (changed && motion.motion_present) {
+            motion_shown = true;
+            motion_shown_since_us = now_us;
+        }
+        if (motion_shown &&
+            now_us - motion_shown_since_us >
+                static_cast<uint64_t>(config_.overlay_motion_hold_ms) * 1000) {
+            motion_shown = false;
+            changed = true;
+        }
+
+        // A new verdict is not necessarily a new picture: the detector
+        // publishes every result, five a second, most of them "still nothing".
+        // Only touch the canvas when what it would show actually differs.
+        if (changed) {
+            const bool same_picture =
+                motion_shown == drawn_motion_shown && crying == drawn_crying &&
+                (!motion_shown ||
+                 (motion.rectangle_count == drawn_motion.rectangle_count &&
+                  memcmp(motion.rectangles, drawn_motion.rectangles,
+                         sizeof(MotionRectangle) * motion.rectangle_count) == 0));
+            if (!same_picture &&
+                overlay_.Draw(motion_shown ? &motion : nullptr, crying)) {
+                overlay_redraws_.fetch_add(1, std::memory_order_relaxed);
+                drawn_motion_shown = motion_shown;
+                drawn_crying = crying;
+                drawn_motion = motion;
+            }
+        }
+    }
+}
+
 void MediaPipeline::StopThreads() {
     stop_threads_.store(true, std::memory_order_relaxed);
     if (encoder_thread_.joinable()) {
@@ -578,6 +658,9 @@ void MediaPipeline::StopThreads() {
     }
     if (detector_thread_.joinable()) {
         detector_thread_.join();
+    }
+    if (overlay_thread_.joinable()) {
+        overlay_thread_.join();
     }
 }
 
@@ -600,11 +683,15 @@ int MediaPipeline::Run() {
     if (config_.enable_motion_detection) {
         detector_thread_ = std::thread([this]() { DetectorLoop(); });
     }
+    if (overlay_.attached()) {
+        overlay_thread_ = std::thread([this]() { OverlayLoop(); });
+    }
 
     pthread_sigmask(SIG_SETMASK, &previous_mask, nullptr);
 
-    RK_LOGI("Media pipeline running (encoder thread%s)",
-            config_.enable_motion_detection ? " + detector thread" : "");
+    RK_LOGI("Media pipeline running (encoder thread%s%s)",
+            config_.enable_motion_detection ? " + detector thread" : "",
+            overlay_.attached() ? " + overlay thread" : "");
 
     uint64_t last_heartbeat_us = 0;
     constexpr uint64_t kHeartbeatIntervalUs = 1000000;
@@ -658,6 +745,11 @@ int MediaPipeline::Run() {
                             ivs_motion_results_.load(std::memory_order_relaxed)),
                         last_ivs_error_.load(std::memory_order_relaxed));
             }
+            if (overlay_.attached()) {
+                RK_LOGI("Overlay: %llu redraws",
+                        static_cast<unsigned long long>(
+                            overlay_redraws_.load(std::memory_order_relaxed)));
+            }
 
             last_report_us = now_us;
             frames_at_last_report = forwarded;
@@ -688,6 +780,10 @@ void MediaPipeline::TeardownBindings() {
 }
 
 void MediaPipeline::TeardownModules() {
+    // Before the encoder: RGN refuses to let a VENC channel with an attached
+    // region be destroyed (RK_ERR_RGN_BUSY).
+    overlay_.Detach();
+
     if (rtsp_session_ != nullptr) {
         rtsp_del_session(rtsp_session_);
         rtsp_session_ = nullptr;

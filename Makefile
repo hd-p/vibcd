@@ -48,6 +48,7 @@ SOURCES := \
 	$(SRC_DIR)/base/robust_mutex.cpp \
 	$(SRC_DIR)/media/isp_controller.cpp \
 	$(SRC_DIR)/media/media_pipeline.cpp \
+	$(SRC_DIR)/media/overlay_renderer.cpp \
 	$(SRC_DIR)/audio/audio_pipeline.cpp \
 	$(SRC_DIR)/app/media_service.cpp \
 	$(SRC_DIR)/app/audio_service.cpp \

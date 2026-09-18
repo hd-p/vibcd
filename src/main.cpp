@@ -45,6 +45,8 @@ void PrintUsage(const char* program_name) {
     printf("      --motion-area <n>  moving area threshold in per-mille (default 20)\n");
     printf("      --no-motion        drop the IVS branch entirely, leaving\n");
     printf("                         VI ch0 -> VENC only\n");
+    printf("      --no-overlay       do not draw motion boxes and the cry\n");
+    printf("                         indicator onto the stream\n");
     printf("      --iqfiles <dir>    sensor tuning files for the ISP 3A loop\n");
     printf("                         (default /etc/iqfiles; empty skips 3A)\n");
     printf("\nAudio:\n");
@@ -79,6 +81,7 @@ enum LongOnlyOption {
     kOptionDetectResolution,
     kOptionMotionArea,
     kOptionNoMotion,
+    kOptionNoOverlay,
     kOptionIqDir,
     kOptionCryModelPath,
     kOptionAudioCard,
@@ -99,6 +102,7 @@ const struct option kLongOptions[] = {
     {"detect", required_argument, nullptr, kOptionDetectResolution},
     {"motion-area", required_argument, nullptr, kOptionMotionArea},
     {"no-motion", no_argument, nullptr, kOptionNoMotion},
+    {"no-overlay", no_argument, nullptr, kOptionNoOverlay},
     {"iqfiles", required_argument, nullptr, kOptionIqDir},
     {"cry-model", required_argument, nullptr, kOptionCryModelPath},
     {"audio-card", required_argument, nullptr, kOptionAudioCard},
@@ -228,6 +232,9 @@ int main(int argc, char* argv[]) {
                 break;
             case kOptionNoMotion:
                 config.media.enable_motion_detection = false;
+                break;
+            case kOptionNoOverlay:
+                config.media.enable_overlay = false;
                 break;
             case kOptionIqDir:
                 // Empty string skips the 3A loop; see the note in Initialise().

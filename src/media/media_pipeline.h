@@ -31,6 +31,7 @@
 #include "base/rk_platform.h"
 #include "base/shared_records.h"
 #include "media/isp_controller.h"
+#include "media/overlay_renderer.h"
 
 namespace baby_monitor {
 
@@ -58,6 +59,16 @@ struct MediaPipelineConfig {
     // path: if the encoder only produces frames with this disabled, the fault
     // is in the fan-out rather than in the encode chain itself.
     bool enable_motion_detection = true;
+
+    // Draw motion rectangles and the cry indicator onto the encoded stream
+    // through the encoder's RGN overlay. Off costs nothing; on costs one
+    // 2bpp canvas (stream_width*stream_height/4 bytes) and a redraw whenever
+    // a verdict changes.
+    bool enable_overlay = true;
+
+    // Boxes are erased this long after the last motion verdict, so a frozen
+    // detector does not leave a stale box on screen forever.
+    uint32_t overlay_motion_hold_ms = 1000;
 
     // IVS motion sensitivity, 1 = low, 2 = medium, 3 = high.
     uint32_t motion_sensitivity = 2;
@@ -118,8 +129,14 @@ private:
     //                   as in the SDK sample, so librtsp is single-threaded)
     //   detector thread owns the IVS channel and the motion mailbox write side
     //   main thread     owns the heartbeat and only reads the atomic counters
+    //   overlay thread  owns the RGN canvas. It is a pure *consumer* of the two
+    //                   shared-memory mailboxes (motion from the detector
+    //                   thread, cry from the audio process), read under the
+    //                   robust mutex like any external process would. Neither
+    //                   producer knows it exists.
     void EncoderLoop();
     void DetectorLoop();
+    void OverlayLoop();
 
     // Moves one encoded frame from VENC to the RTSP session. Returns false only
     // on an error worth logging; an empty queue is a normal outcome.
@@ -171,6 +188,12 @@ private:
 
     std::thread encoder_thread_;
     std::thread detector_thread_;
+    std::thread overlay_thread_;
+
+    // Overlay-thread private state. Declared before the MPI teardown order
+    // matters: Detach() must precede VENC destruction, which TeardownModules
+    // does explicitly.
+    OverlayRenderer overlay_;
 
     // Cross-thread stop flag. Distinct from the sig_atomic_t the signal
     // handler sets: that one is only safe from a handler, this one is only
@@ -187,6 +210,7 @@ private:
     std::atomic<uint64_t> ivs_results_{0};
     std::atomic<uint64_t> ivs_motion_results_{0};
     std::atomic<int32_t> last_ivs_error_{0};
+    std::atomic<uint64_t> overlay_redraws_{0};
 };
 
 }  // namespace baby_monitor
